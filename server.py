@@ -2,6 +2,7 @@ import asyncio
 import base64
 import os
 import signal
+import subprocess
 import re
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -72,7 +73,7 @@ mcp = FastMCP(
 
 # How long a single (warm) verify may run before we give up (Lean elaboration
 # for a hard proof can be slow; this is the backstop, not the normal path).
-VERIFY_TIMEOUT = 180.0
+VERIFY_TIMEOUT = float(os.environ.get("LEAK_VERIFY_TIMEOUT", "180"))
 # What every script compiles against: the Tengoku tree's root. Newline-separated
 # import lines; the first one also replaces a legacy `import Mathlib`.
 TENGOKU_IMPORTS = os.environ.get("TENGOKU_IMPORTS", "import Tengoku").strip()
@@ -140,6 +141,11 @@ class LeanCompilerDaemon:
         self.sandbox_path = Path(self.project_dir).resolve() / "virtual_sandbox.lean"
         self.uri = self.sandbox_path.as_uri()
         self._is_file_open = False
+        # Counters a reader of /health can watch: how often a script ran past the
+        # cap and how often the file worker had to be replaced.
+        self.verify_timeouts = 0
+        self.worker_restarts = 0
+        self.last_verify_ms: int | None = None
         logger.info(f"🔧 [INIT] project_dir={self.project_dir!r}  uri={self.uri}")
         try:
             with open(self.sandbox_path, "a"):
@@ -251,14 +257,87 @@ class LeanCompilerDaemon:
                 except BaseException:
                     pass  # swallow the cancellation / already-handled exception
 
-    async def _recover_worker(self, n: int):
-        """A file worker crashed but the `lake serve` WATCHDOG is usually still
-        alive (that's what returns -32902 workerCrashed). Tear the dead worker
-        down with didClose so the NEXT verify re-opens a fresh one (~Mathlib
-        re-import, ~80s) — far cheaper than a full daemon reboot, and it un-poisons
-        the session so healthy scripts stop failing. If the watchdog itself is
-        gone, force a full reboot on the next call instead."""
+    def _worker_pids(self) -> list[int]:
+        """The `lean --worker` processes the watchdog forked: descendants of the
+        `lake serve` process whose command line says --worker. /proc on Linux,
+        `ps` elsewhere. Never raises."""
+        if not self.process or self.process.returncode is not None:
+            return []
+        root = self.process.pid
+        procs: dict[int, tuple[int, str]] = {}
+        try:
+            if os.path.isdir("/proc"):
+                for d in os.listdir("/proc"):
+                    if not d.isdigit():
+                        continue
+                    pid = int(d)
+                    try:
+                        with open(f"/proc/{pid}/stat") as f:
+                            stat = f.read()
+                        with open(f"/proc/{pid}/cmdline", "rb") as f:
+                            cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+                    except OSError:
+                        continue
+                    # ppid is the 4th field after the parenthesised comm, which may hold spaces
+                    ppid = int(stat.rsplit(")", 1)[1].split()[1])
+                    procs[pid] = (ppid, cmd)
+            else:
+                out = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=10).stdout
+                for line in out.splitlines():
+                    parts = line.split(None, 2)
+                    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                        procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+        except Exception as e:
+            logger.warning(f"could not list processes: {e}")
+            return []
+        found: list[int] = []
+        frontier = [root]
+        seen = set()
+        while frontier:
+            parent = frontier.pop()
+            for pid, (ppid, cmd) in procs.items():
+                if ppid == parent and pid not in seen:
+                    seen.add(pid)
+                    frontier.append(pid)
+                    if "--worker" in cmd:
+                        found.append(pid)
+        return found
+
+    async def _kill_workers(self, n: int, grace: float = 1.0) -> list[int]:
+        """Stop the file worker(s) for real. didClose makes the watchdog send the
+        worker an `exit` notification, which a worker busy in the kernel (a
+        `decide +kernel` on a 30 000-digit number) does not act on: kernel
+        reduction cannot be interrupted, and the next script's diagnostics then
+        wait behind it. So after a short grace the survivors are killed."""
+        await asyncio.sleep(grace)
+        killed = []
+        for pid in self._worker_pids():
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                logger.warning(f"[#{n}] could not kill worker {pid}: {e}")
+        if killed:
+            logger.error(f"💀 [#{n}] killed file worker process(es) {killed}")
+        return killed
+
+    async def _recover_worker(self, n: int, reason: str = "crash"):
+        """A file worker crashed, or a verify ran past the cap. Either way the
+        `lake serve` WATCHDOG is usually still alive (that's what returns -32902
+        workerCrashed). Tear the worker down with didClose, and kill it if it is
+        still there, so the NEXT verify re-opens a fresh one (~Mathlib re-import,
+        ~80s) — far cheaper than a full daemon reboot, and it un-poisons the
+        session so healthy scripts stop failing. If the watchdog itself is gone,
+        force a full reboot on the next call instead.
+
+        The timeout case is the 2026-10-20 outage: one `decide +kernel` on a
+        five-digit witness ran past 180 s; the cap released the lock but left the
+        worker computing, every later script's waitForDiagnostics queued behind
+        it, and four clients saw nothing but timeouts for 25 minutes."""
         self._crash_event.clear()
+        self.worker_restarts += 1
         if not self.process or self.process.returncode is not None:
             self.process = None
             self._is_file_open = False
@@ -270,8 +349,11 @@ class LeanCompilerDaemon:
                                  {"textDocument": {"uri": self.uri}})
         except Exception:
             self.process = None            # watchdog stdin dead → reboot next call
+            self._is_file_open = False
+            return
         self._is_file_open = False
-        logger.info(f"♻️  [#{n}] file-worker respawn armed (didClose sent; next verify re-opens)")
+        await self._kill_workers(n)
+        logger.info(f"♻️  [#{n}] file-worker respawn armed after {reason} (didClose sent; next verify re-opens)")
 
     # ---- the one public operation -----------------------------------------
     async def verify_script(self, script: str, timeout: float = VERIFY_TIMEOUT) -> str:
@@ -414,6 +496,7 @@ class LeanCompilerDaemon:
                     logger.info(f"💡 [#{n}] {len(hints)} tactic suggestion(s) harvested")
 
                 elapsed = int((time.time() - t0) * 1000)
+                self.last_verify_ms = elapsed
                 if not bad:
                     logger.info(f"✅ [#{n}] VERIFIED in {elapsed}ms — no errors/warnings")
                     # Callers persist "the script that got proved" as the final
@@ -454,6 +537,20 @@ class LeanCompilerDaemon:
                         "stack overflow or bug) while checking this script. The "
                         "daemon has self-healed — retry a different/lighter script. "
                         f"Detail: {e}")
+
+            except TimeoutError as e:
+                # The script ran past the cap. The worker is still computing (a
+                # kernel reduction cannot be interrupted), and left alone it would
+                # hold every later script's diagnostics behind it: replace it.
+                self.verify_timeouts += 1
+                logger.error(f"⏱️  [#{n}] {e} — replacing the file worker")
+                await self._recover_worker(n, reason="timeout")
+                return (f"❌ Verification Error: {e}. The Lean worker was stopped so that "
+                        "the next script starts fresh. Do not resubmit this script as it "
+                        "is: what runs this long is almost always a kernel evaluation on a "
+                        "large numeral (`decide`, `decide +kernel`, `native_decide`, `rfl` "
+                        "on big values), which cannot be interrupted. Prove the statement "
+                        "structurally, or shrink the numeral.")
 
             except Exception as e:
                 logger.error(f"💥 [#{n}] {traceback.format_exc()}")
@@ -708,6 +805,39 @@ async def _warmup():
         logger.error(f"⚠️  Warmup did not finish: {e}")
 
 
+async def _health_endpoint(request):
+    """What the daemon has been doing: for a reader who wants to know whether a
+    stall is the verifier's (a script past the cap, a worker replaced) without
+    reading the logs."""
+    from starlette.responses import JSONResponse
+    p = fast_compiler.process
+    return JSONResponse({
+        "elaborator": "up" if p and p.returncode is None else "down",
+        "file_open": fast_compiler._is_file_open,
+        "verifies": fast_compiler.verify_count,
+        "verify_timeouts": fast_compiler.verify_timeouts,
+        "worker_restarts": fast_compiler.worker_restarts,
+        "last_verify_ms": fast_compiler.last_verify_ms,
+        "verify_timeout_s": VERIFY_TIMEOUT,
+        "busy": fast_compiler.lock.locked(),
+    })
+
+
+def build_app():
+    """The HTTP app: the MCP SSE transport plus the two plain endpoints."""
+    http_app = mcp.sse_app()
+    http_app.add_route("/refresh", _refresh_endpoint, methods=["GET", "POST"])
+    http_app.add_route("/health", _health_endpoint, methods=["GET"])
+    http_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*", "mcp-protocol-version", "mcp-session-id"],
+        expose_headers=["mcp-session-id"],
+    )
+    return http_app
+
+
 async def main_serve():
     logger.info("=" * 60)
     logger.info("Booting Leak Lean Daemon…")
@@ -722,15 +852,7 @@ async def main_serve():
     #     restarting the load — the thrash that kept Mathlib from ever loading.
     asyncio.create_task(_startup())
 
-    http_app = mcp.sse_app()
-    http_app.add_route("/refresh", _refresh_endpoint, methods=["GET", "POST"])
-    http_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*", "mcp-protocol-version", "mcp-session-id"],
-        expose_headers=["mcp-session-id"],
-    )
+    http_app = build_app()
 
     port = int(os.environ.get("PORT", "7860"))
     logger.info(f"🌐 Serving MCP (SSE) on 0.0.0.0:{port}")

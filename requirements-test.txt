@@ -1,0 +1,5 @@
+# what server.py imports (the image installs the same with uv), plus the test client
+mcp<2
+starlette
+uvicorn
+httpx
