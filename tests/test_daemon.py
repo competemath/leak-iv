@@ -112,7 +112,19 @@ class DaemonCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(compiled.startswith(server.TENGOKU_IMPORTS.split("\n")[0]), compiled)
         self.assertIn("theorem t : True := trivial", compiled)
         sent = [e for e in lake_log() if e["method"] == "textDocument/didOpen"][-1]["text"]
-        self.assertEqual(sent.strip(), compiled.strip(), "what the marker carries is what was compiled")
+        self.assertTrue(sent.startswith(compiled.strip()), "what the marker carries is the user's part of what was compiled")
+        self.assertIn("rogue axiom(s)", sent[len(compiled.strip()):], "followed by the axiom gate")
+
+    async def test_the_axiom_closure_gate_is_sent_with_every_script_but_not_persisted(self):
+        """The security gate (2026-10-07): without it `axiom cheat : False` followed by `cheat.elim` verified any
+        statement. It is compiled after the user's script and is not part of the saved certificate."""
+        r = await self.d.verify_script("theorem t : True := trivial")
+        sent = [e for e in lake_log() if e["method"] in ("textDocument/didOpen", "textDocument/didChange")][-1]["text"]
+        self.assertIn("rogue axiom(s) introduced by this script", sent)
+        self.assertIn("env.constants", sent)
+        self.assertTrue(sent.index("theorem t : True := trivial") < sent.index("run_cmd"), "the gate runs after the user's script")
+        b64 = r.split("[[LEAK_NORMALIZED_SCRIPT_B64:")[1].split("]]")[0]
+        self.assertNotIn("rogue axiom", base64.b64decode(b64).decode(), "the certificate is the user's script, not the gate")
 
     async def test_legacy_mathlib_import_is_rewritten_to_the_tree(self):
         r = await self.d.verify_script("import Mathlib\nimport Mathlib.Data.Nat.Basic\n\ntheorem t : True := trivial")
@@ -222,6 +234,21 @@ class ConstantsCase(unittest.TestCase):
             self.assertIn(m, server._CRASH_MARKERS)
         self.assertIn(-32902, server._WORKER_DEAD_CODES)
         self.assertIn(-32900, server._WORKER_DEAD_CODES)
+
+    def test_the_axiom_gate_allows_exactly_the_baseline_and_nothing_a_script_can_add(self):
+        gate = server.AXIOM_CHECK
+        # the trust set and the native_decide oracle ...
+        for name in ("`propext", "`Classical.choice", "`Quot.sound", "`Lean.ofReduceBool", "`Lean.trustCompiler"):
+            self.assertIn(name, gate)
+        # ... and the markers Lean declares in every environment (the first deployment rejected `n + 0 = n := by simp` without them)
+        for name in ("`sorryAx", "`lcAny", "`lcProof", "`lcErased", "`lcCast", "`lcVoid", "`lcUnreachable", "`Quot.lcInv", "`isScalarObj", "`Lean.ofReduceNat"):
+            self.assertIn(name, gate)
+        # it must still reject by throwing, and must look at axiom-kind constants only
+        self.assertIn("throwError", gate)
+        self.assertIn(".axiomInfo", gate)
+        self.assertIn("allowed.contains n", gate)
+        # the allowlist is a literal list of names, not something built from the script
+        self.assertIn("let allowed : List Name :=", gate)
 
     def test_warmup_has_its_own_long_ceiling(self):
         self.assertGreaterEqual(server.WARMUP_TIMEOUT, 600)
