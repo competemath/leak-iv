@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import os
 import signal
 import subprocess
@@ -84,7 +85,8 @@ TENGOKU_DIR = os.environ.get("LEAN_PROJECT_PATH", ".")
 # one-off warmup gets a much larger ceiling. If this is too small, the warmup
 # times out mid-load, the next verify's didChange restarts the load, and Mathlib
 # never becomes resident — which is exactly what made the daemon look "stuck".
-WARMUP_TIMEOUT = 1200.0
+WARMUP_TIMEOUT = float(os.environ.get("LEAK_WARMUP_TIMEOUT", "1200"))
+WARMUP_SCRIPT = "theorem warmup : 1 + 1 = 2 := by rfl"
 
 
 AXIOM_CHECK = """
@@ -140,7 +142,12 @@ class LeanCompilerDaemon:
         self.verify_count = 0               # for log correlation
         self.sandbox_path = Path(self.project_dir).resolve() / "virtual_sandbox.lean"
         self.uri = self.sandbox_path.as_uri()
-        self._is_file_open = False
+        self._is_file_open = self._warm = False
+        # Warm = the current file worker has answered at least one request, so the Tengoku tree is loaded in it. A fresh worker
+        # needs ~200 s to load it (more on a loaded CPU), longer than the 180 s a verify may take: charged to a script, a cold
+        # start looked like "verify exceeded 180s", and the next request's didChange restarted the load, so with clients retrying
+        # it never finished (2026-10-20: 25 min, then three hours). A cold worker is therefore warmed first, with its own ceiling.
+        self._warm = False
         # Counters a reader of /health can watch: how often a script ran past the
         # cap and how often the file worker had to be replaced.
         self.verify_timeouts = 0
@@ -180,7 +187,7 @@ class LeanCompilerDaemon:
                 logger.info("✅ [BOOT] initialize handshake complete")
                 break
         await self._send("initialized", {})
-        self._is_file_open = False
+        self._is_file_open = self._warm = False
         logger.info("✅ [BOOT] daemon online")
 
     async def _log_stderr(self):
@@ -340,7 +347,7 @@ class LeanCompilerDaemon:
         self.worker_restarts += 1
         if not self.process or self.process.returncode is not None:
             self.process = None
-            self._is_file_open = False
+            self._is_file_open = self._warm = False
             logger.error(f"♻️  [#{n}] watchdog gone — full reboot armed for next call")
             return
         try:
@@ -349,16 +356,29 @@ class LeanCompilerDaemon:
                                  {"textDocument": {"uri": self.uri}})
         except Exception:
             self.process = None            # watchdog stdin dead → reboot next call
-            self._is_file_open = False
+            self._is_file_open = self._warm = False
             return
-        self._is_file_open = False
+        self._is_file_open = self._warm = False
         await self._kill_workers(n)
         logger.info(f"♻️  [#{n}] file-worker respawn armed after {reason} (didClose sent; next verify re-opens)")
 
     # ---- the one public operation -----------------------------------------
     async def verify_script(self, script: str, timeout: float = VERIFY_TIMEOUT) -> str:
         async with self.lock:
-            self.verify_count += 1
+            if not self._warm:
+                # A new or replaced worker: load the tree first, under the long ceiling, so the script is not charged for it
+                # and nothing that arrives meanwhile restarts the load.
+                logger.info("🌡️  cold file worker — warming before this script")
+                await self._verify(WARMUP_SCRIPT, WARMUP_TIMEOUT, lock_held=True, warming=True)
+                if not self._warm:
+                    return ("❌ Verification Error: the verifier is still loading the Tengoku tree after a restart "
+                            "(it takes a few minutes). Nothing was checked. Try again shortly.")
+            return await self._verify(script, timeout, lock_held=True)
+
+    async def _verify(self, script: str, timeout: float, *, lock_held: bool = False, warming: bool = False) -> str:
+        async with (contextlib.nullcontext() if lock_held else self.lock):
+            if not warming:
+                self.verify_count += 1
             n = self.verify_count
             t0 = time.time()
 
@@ -443,6 +463,7 @@ class LeanCompilerDaemon:
                                 raise WorkerCrashed(f"waitForDiagnostics: {err}")
                             raise RuntimeError(
                                 f"waitForDiagnostics error: {msg['error']}")
+                        self._warm = True
                         logger.info(f"🏁 [#{n}] waitForDiagnostics returned "
                                     f"({publishes} publishes merged)")
                         break
@@ -545,19 +566,20 @@ class LeanCompilerDaemon:
                 self.verify_timeouts += 1
                 logger.error(f"⏱️  [#{n}] {e} — replacing the file worker")
                 await self._recover_worker(n, reason="timeout")
+                if warming:
+                    return f"❌ Verification Error: the tree did not load within {timeout:.0f}s ({e})."
                 return (f"❌ Verification Error: {e}. The Lean worker was stopped so that "
-                        "the next script starts fresh. Do not resubmit this script as it "
-                        "is: what runs this long is almost always a kernel evaluation on a "
-                        "large numeral (`decide`, `decide +kernel`, `native_decide`, `rfl` "
-                        "on big values), which cannot be interrupted. Prove the statement "
-                        "structurally, or shrink the numeral.")
+                        "the next script starts on a fresh one (loaded before it runs). Do not "
+                        "resubmit this script as it is. If it asks the kernel to evaluate a large "
+                        "numeral (`decide`, `decide +kernel`, `native_decide`, `rfl` on big values) "
+                        "that cannot be interrupted: prove the statement structurally instead.")
 
             except Exception as e:
                 logger.error(f"💥 [#{n}] {traceback.format_exc()}")
                 # A dead pipe/EOF means the LSP crashed — force a reboot next call.
                 if isinstance(e, (EOFError, BrokenPipeError)):
                     self.process = None
-                    self._is_file_open = False
+                    self._is_file_open = self._warm = False
                     logger.error(f"♻️  [#{n}] LSP marked for reboot")
                 return f"❌ Verification Error: {e}"
 
@@ -798,9 +820,12 @@ async def _warmup():
     logger.info("⏳ Warmup: cold-loading the Tengoku tree into the elaborator "
                 "(first load can take several minutes on a small CPU)…")
     try:
-        r = await fast_compiler.verify_script(
-            "theorem warmup : 1 + 1 = 2 := by rfl", timeout=WARMUP_TIMEOUT)
-        logger.info(f"✅ Warmup complete — Tengoku resident. Result: {r}")
+        async with fast_compiler.lock:
+            if not fast_compiler._warm:
+                r = await fast_compiler._verify(WARMUP_SCRIPT, WARMUP_TIMEOUT, lock_held=True, warming=True)
+            else:
+                r = "already warm"
+        logger.info(f"✅ Warmup complete — Tengoku resident. Result: {r[:80]}")
     except Exception as e:
         logger.error(f"⚠️  Warmup did not finish: {e}")
 
@@ -818,6 +843,7 @@ async def _health_endpoint(request):
         "verify_timeouts": fast_compiler.verify_timeouts,
         "worker_restarts": fast_compiler.worker_restarts,
         "last_verify_ms": fast_compiler.last_verify_ms,
+        "warm": fast_compiler._warm,
         "verify_timeout_s": VERIFY_TIMEOUT,
         "busy": fast_compiler.lock.locked(),
     })

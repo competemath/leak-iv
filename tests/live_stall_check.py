@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""By hand, against a running Leak IV (not in CI): does one script past the cap
-still stall everyone else?
+"""By hand, against a running Leak IV (not in CI): can a cold file worker still
+stall everyone?
 
     python3 tests/live_stall_check.py https://barkingtree-leak-iv.hf.space
 
-Client A submits the script that caused the 2026-10-20 outage (a kernel
-evaluation on a five-digit witness). Client B, on its own connection, submits a
-trivial `example` right after. Before the fix B waited for A's kernel reduction
-to finish (25 minutes); with it, A gets "verify exceeded" at the cap and B is
-answered within the cap plus a worker respawn. /health is read before and after.
+What stalled the verifier on 2026-10-20 was the cold start of the Lean file worker,
+not a script: a fresh worker needs about 200 s to load the tree, more than the 180 s a
+verify may take, so the first script after any restart looked like "verify exceeded
+180s", and the next request restarted the load, so with clients retrying it never
+finished (25 minutes, then three hours). The check reproduces that sequence: client A
+restarts the elaborator (`tengoku_sync`), client B submits a trivial script one second
+later, and then the exact script that was blamed. Before the fix B's script came back
+as "verify exceeded 180s". With it, B waits for the load (a few minutes) and is
+answered with success, /health shows no timeouts and a warm worker, and the blamed
+script (a kernel evaluation that takes about 11 s on a warm worker) also succeeds.
 Plain urllib, no dependencies."""
 import json
 import sys
@@ -17,9 +22,26 @@ import time
 import urllib.request
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "https://barkingtree-leak-iv.hf.space").rstrip("/")
-BIG = ("open Nat in\n"
-       "theorem E396_k4_stall_check : (45153 : ℕ).descFactorial 5 ∣ (45153 : ℕ).centralBinom := by\n"
-       "  rw [Nat.centralBinom_eq_two_mul_choose]\n  decide +kernel")
+BIG = r"""open Nat in
+lemma cb_eq' (n : ℕ) : n.centralBinom = (2 * n).descFactorial n / n ! := by
+  rw [Nat.centralBinom_eq_two_mul_choose, Nat.choose_eq_descFactorial_div_factorial]
+
+open Nat in
+theorem E396_k2 : descFactorial 2480 3 ∣ centralBinom 2480 := by
+  rw [cb_eq']
+  decide +kernel
+
+open Nat in
+theorem E396_k3 : descFactorial 8178 4 ∣ centralBinom 8178 := by
+  rw [cb_eq']
+  decide +kernel
+
+open Nat in
+theorem E396_k4 : descFactorial 45153 5 ∣ centralBinom 45153 := by
+  rw [cb_eq']
+  decide +kernel"""
+# ^ the exact script trial 7 sent at 15:08:37 UTC on 2026-10-20: the first two kernel evaluations pass in seconds, the third (a five-digit
+#   numeral) does not come back, and before the fix it held the verifier for everyone for 25 minutes
 SMALL = "example : (2 : ℕ) + 2 = 4 := by norm_num"
 
 
@@ -89,19 +111,38 @@ def health():
         return {"error": str(e)[:80]}
 
 
-print("health before:", health())
+
+def health():
+    try:
+        return json.loads(urllib.request.urlopen(f"{BASE}/health", timeout=30).read())
+    except Exception as e:
+        return {"error": str(e)[:80]}
+
+
+h0 = health()
+print("health before:", h0)
 a, b = Client("A"), Client("B")
-out = {}
-ta = threading.Thread(target=lambda: out.__setitem__("a", a.verify(1, BIG)))
+t_sync = {}
+def restart():
+    t0 = time.time()
+    r = a.call(1, "tools/call", {"name": "tengoku_sync", "arguments": {}}, timeout=1200)
+    t_sync["s"] = (time.time() - t0, ((r.get("result") or {}).get("content") or [{}])[0].get("text", "")[:120])
+ta = threading.Thread(target=restart)
 ta.start()
-time.sleep(5)
-tb, text_b = b.verify(1, SMALL)
+time.sleep(1)
+t1, text1 = b.verify(1, SMALL)
 ta.join()
-dur_a, text_a = out["a"]
-print(f"A (kernel evaluation on 45153): {dur_a:.0f}s -> {text_a[:160]!r}")
-print(f"B (trivial, 5 s later):         {tb:.0f}s -> {text_b[:100]!r}")
-h = health()
-print("health after:", h)
-ok = tb < 400 and "Compilation Successful" in text_b and "exceeded" in text_a
-print("RESULT:", "FIXED: the trivial script was not stuck behind the stalled one" if ok else "STILL STALLING or unexpected: see above")
+print(f"A restart (tengoku_sync): {t_sync['s'][0]:.0f}s -> {t_sync['s'][1]!r}")
+print(f"B trivial script, 1 s after the restart began: {t1:.0f}s -> {text1[:90]!r}")
+t2, text2 = b.verify(2, BIG)
+print(f"B the outage script, on the warmed worker: {t2:.0f}s -> {text2[:90]!r}")
+h1 = health()
+print("health after:", h1)
+ok = (
+    "Compilation Successful" in text1
+    and "Compilation Successful" in text2
+    and h1.get("verify_timeouts", 0) == h0.get("verify_timeouts", 0)
+    and h1.get("warm") is True
+)
+print("RESULT:", "FIXED: a restart no longer makes scripts time out" if ok else "STILL BROKEN or unexpected: see above")
 sys.exit(0 if ok else 1)

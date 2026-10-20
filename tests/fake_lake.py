@@ -13,6 +13,10 @@ the script text it is given.
                  $FAKE_LAKE_WORKER_PID_FILE.
   FAKE_CRASH     "Aborting." on stderr, then the watchdog's -32902 error
 
+Cold start: with $FAKE_COLD_S=N a worker that has just been opened takes N seconds to answer its first request (loading the
+tree), and, like the real worker, a new document version (didChange) while it is still loading RESTARTS that load. A request
+whose version has been superseded is never answered. After the first answer the worker is warm and answers at once.
+
 What it received is appended to $FAKE_LAKE_LOG as JSON lines (method, text),
 so a test can check what was compiled (for example that `import Mathlib` became
 the tree's import).
@@ -22,12 +26,14 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 LOG = os.environ.get("FAKE_LAKE_LOG")
 PID_FILE = os.environ.get("FAKE_LAKE_WORKER_PID_FILE")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-state = {"text": "", "version": 0, "open": False, "stuck": False, "worker": None}
+COLD_S = float(os.environ.get("FAKE_COLD_S", "0"))
+state = {"text": "", "version": 0, "open": False, "stuck": False, "worker": None, "cold": False, "ready_at": 0.0}
 out_lock = threading.Lock()
 
 
@@ -93,6 +99,17 @@ def answer(msg_id, uri, version, text):
     send({"jsonrpc": "2.0", "id": msg_id, "result": None})
 
 
+def answer_when_ready(msg_id, uri, version):
+    while True:
+        if state["version"] != version or not state["open"]:
+            return  # superseded (a later didChange) or closed: this request is never answered
+        if time.time() >= state["ready_at"] or not state["cold"]:
+            break
+        time.sleep(0.05)
+    state["cold"] = False
+    answer(msg_id, uri, version, state["text"])
+
+
 def main():
     while True:
         msg = read()
@@ -103,22 +120,24 @@ def main():
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
         elif method == "textDocument/didOpen":
-            state.update(text=params["textDocument"]["text"], version=params["textDocument"]["version"], open=True, stuck=False)
+            state.update(text=params["textDocument"]["text"], version=params["textDocument"]["version"], open=True, stuck=False, cold=COLD_S > 0, ready_at=time.time() + COLD_S)
             start_worker()
             log(method, text=state["text"], version=state["version"])
         elif method == "textDocument/didChange":
             state.update(text=params["contentChanges"][0]["text"], version=params["textDocument"]["version"])
+            if state["cold"]:
+                state["ready_at"] = time.time() + COLD_S  # a new version while loading restarts the load
             log(method, text=state["text"], version=state["version"])
         elif method == "textDocument/didClose":
             # like the real watchdog: the worker is told to exit (ours ignores it) and the document is gone
-            state.update(open=False, stuck=False)
+            state.update(open=False, stuck=False, cold=False)
             log(method)
         elif method == "textDocument/waitForDiagnostics":
             log(method, version=params.get("version"))
             if state["stuck"] or not state["open"]:
                 # a stuck worker answers nothing, for this version or any later one, until it is replaced
                 continue
-            answer(msg["id"], params["uri"], params.get("version"), state["text"])
+            threading.Thread(target=answer_when_ready, args=(msg["id"], params["uri"], params.get("version")), daemon=True).start()
         elif method == "shutdown":
             send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
         elif method == "exit":

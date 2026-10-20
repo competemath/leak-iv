@@ -79,8 +79,15 @@ def alive(pid):
     return bool(st) and not st.startswith("Z")
 
 
-class DaemonCase(unittest.IsolatedAsyncioTestCase):
+class _Base(unittest.IsolatedAsyncioTestCase):
+    cold_s = "0"
+    warmup_s = None
+
     async def asyncSetUp(self):
+        os.environ["FAKE_COLD_S"] = self.cold_s
+        self._old_warmup = server.WARMUP_TIMEOUT
+        if self.warmup_s is not None:
+            server.WARMUP_TIMEOUT = self.warmup_s
         for f in (_ENV["FAKE_LAKE_LOG"], _ENV["FAKE_LAKE_WORKER_PID_FILE"]):
             try:
                 os.remove(f)
@@ -90,6 +97,8 @@ class DaemonCase(unittest.IsolatedAsyncioTestCase):
         await self.d.boot()
 
     async def asyncTearDown(self):
+        server.WARMUP_TIMEOUT = self._old_warmup
+        os.environ["FAKE_COLD_S"] = "0"
         for pid in worker_pids():
             try:
                 os.kill(pid, 9)
@@ -103,6 +112,9 @@ class DaemonCase(unittest.IsolatedAsyncioTestCase):
             except asyncio.TimeoutError:
                 pass
 
+
+
+class DaemonCase(_Base):
     # ---- the contract the callers (the bridge, the memory) parse -----------------------------------------------------------------
     async def test_success_contract_and_import_injection(self):
         r = await self.d.verify_script("theorem t : True := trivial")
@@ -111,7 +123,7 @@ class DaemonCase(unittest.IsolatedAsyncioTestCase):
         compiled = base64.b64decode(b64).decode()
         self.assertTrue(compiled.startswith(server.TENGOKU_IMPORTS.split("\n")[0]), compiled)
         self.assertIn("theorem t : True := trivial", compiled)
-        sent = [e for e in lake_log() if e["method"] == "textDocument/didOpen"][-1]["text"]
+        sent = [e for e in lake_log() if e["method"] in ("textDocument/didOpen", "textDocument/didChange")][-1]["text"]  # a cold worker is opened with the warm-up first
         self.assertTrue(sent.startswith(compiled.strip()), "what the marker carries is the user's part of what was compiled")
         self.assertIn("rogue axiom(s)", sent[len(compiled.strip()):], "followed by the axiom gate")
 
@@ -181,6 +193,7 @@ class DaemonCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("verify exceeded 2s", r)
         self.assertIn("worker was stopped", r)
         self.assertIn("Do not resubmit", r)
+        self.assertIn("loaded before it runs", r)
         self.assertEqual(self.d.verify_timeouts, 1)
         self.assertEqual(self.d.worker_restarts, 1)
         pids = worker_pids()
@@ -221,6 +234,65 @@ class DaemonCase(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(h["busy"])
 
 
+class ColdStartCase(_Base):
+    """The mechanism behind the 2026-10-20 stalls. A fresh Lean worker needs minutes to load the tree (here 3 s against a 1.5 s
+    cap); charged to a script it looked like a timeout, and the next request restarted the load, so it never finished."""
+
+    cold_s = "3"
+    warmup_s = 30.0
+
+    async def test_a_cold_start_is_not_charged_to_the_script(self):
+        t0 = time.time()
+        r = await self.d.verify_script("theorem t : True := trivial", timeout=1.5)
+        self.assertTrue(r.startswith(SUCCESS), r)
+        self.assertGreater(time.time() - t0, 2.5, "the load took its time")
+        self.assertEqual(self.d.verify_timeouts, 0, "and was not a timeout")
+        self.assertTrue(self.d._warm)
+
+    async def test_requests_arriving_during_the_load_do_not_restart_it(self):
+        rs = await asyncio.gather(*[self.d.verify_script(f"theorem t{i} : True := trivial", timeout=1.5) for i in range(4)])
+        for r in rs:
+            self.assertTrue(r.startswith(SUCCESS), r)
+        self.assertEqual(self.d.verify_timeouts, 0)
+        opens = [e["method"] for e in lake_log() if e["method"] in ("textDocument/didOpen", "textDocument/didChange")]
+        self.assertEqual(opens.count("textDocument/didOpen"), 1, "one worker, loaded once")
+
+    async def test_after_a_kill_the_replacement_is_warmed_before_the_next_script_so_there_is_no_kill_loop(self):
+        await self.d.verify_script("theorem warm : True := trivial", timeout=10)
+        r = await self.d.verify_script("theorem big : True := by\n  decide +kernel -- FAKE_STUCK", timeout=1.5)
+        self.assertIn("verify exceeded", r)
+        self.assertEqual(self.d.worker_restarts, 1)
+        self.assertFalse(self.d._warm, "a replaced worker is cold")
+        t0 = time.time()
+        r2 = await self.d.verify_script("theorem small : True := trivial", timeout=1.5)
+        self.assertTrue(r2.startswith(SUCCESS), r2)
+        self.assertGreater(time.time() - t0, 2.5, "it waited for the reload, without being charged for it")
+        self.assertEqual(self.d.worker_restarts, 1, "no second kill")
+        self.assertEqual(self.d.verify_timeouts, 1)
+
+    async def test_health_says_whether_the_worker_is_warm(self):
+        from starlette.testclient import TestClient
+        server.fast_compiler = self.d
+        with TestClient(server.build_app()) as c:
+            self.assertFalse(c.get("/health").json()["warm"])
+            await self.d.verify_script("theorem t : True := trivial", timeout=10)
+            self.assertTrue(c.get("/health").json()["warm"])
+
+
+class ColdStartThatNeverEndsCase(_Base):
+    cold_s = "60"
+    warmup_s = 2.0
+
+    async def test_a_tree_that_will_not_load_is_reported_as_loading_and_the_script_is_not_run(self):
+        t0 = time.time()
+        r = await self.d.verify_script("theorem t : True := trivial", timeout=1.5)
+        self.assertIn("still loading the Tengoku tree", r)
+        self.assertIn("Nothing was checked", r)
+        self.assertLess(time.time() - t0, 12)
+        sent = [e for e in lake_log() if e["method"] in ("textDocument/didOpen", "textDocument/didChange")]
+        self.assertTrue(all("theorem t : True" not in e["text"] for e in sent), "the user's script never reached a cold worker")
+
+
 class ConstantsCase(unittest.TestCase):
     """Guardrails that exist because of earlier outages; a change that drops one should fail here."""
 
@@ -250,8 +322,10 @@ class ConstantsCase(unittest.TestCase):
         # the allowlist is a literal list of names, not something built from the script
         self.assertIn("let allowed : List Name :=", gate)
 
-    def test_warmup_has_its_own_long_ceiling(self):
+    def test_warmup_has_its_own_long_ceiling_above_the_verify_cap(self):
         self.assertGreaterEqual(server.WARMUP_TIMEOUT, 600)
+        self.assertGreater(server.WARMUP_TIMEOUT, 2 * server.VERIFY_TIMEOUT, "a cold load (about 200 s) must not be charged to the verify cap")
+        self.assertIn("LEAK_WARMUP_TIMEOUT", open(os.path.join(ROOT, "server.py")).read())
 
     def test_the_tree_import_is_injected_by_default(self):
         self.assertTrue(server.TENGOKU_IMPORTS.startswith("import Tengoku"))
