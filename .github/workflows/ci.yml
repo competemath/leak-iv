@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main, tengoku-env]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-test.txt
+      - run: python -m py_compile server.py tests/fake_lake.py tests/fake_worker.py
+      # the daemon against a fake `lake serve`: the callers' contract, crash recovery, the timeout fix, /health
+      - run: python -m unittest discover -s tests -t . -v
