@@ -127,6 +127,74 @@ trust set and the native_decide oracle): {rogue}"
 """
 
 
+STATEMENT_GATE_SOURCES = (
+    "https://github.com/leanprover/comparator#definition-holes",
+    "https://github.com/google-deepmind/formal-conjectures/blob/main/CONTRIBUTING.md#the-question-attribute",
+)
+
+# The answer-slot form `(True : Prop) <-> P`, `(False : Prop) <-> P`, `(sorry : Prop) <-> P` is repudiated (2026-10). A statement written
+# with a free Prop slot has to be policed from outside the kernel: the slot can be filled with the hypothesis itself and closed by
+# `Iff.rfl`, which is why the Lean community's comparator says such definition holes "can be gamed" and must always get an additional
+# check, and why formal-conjectures dropped `answer(sorry)` for the plain statement, negated with a not-sign when the answer is no. So a
+# question is stated as plain theorems (`theorem NAME : P`, and separately `theorem NAME_neg : not (P)`), and a theorem whose
+# statement is an iff with a bare True, False or sorry on its left is an error with this message. Only declarations this script
+# added are looked at (`map2` of the constant map), so nothing in the tree can trip it; a definition such as `def S : Prop := True`
+# is looked through, so `theorem t : S <-> P` is caught too; leading forall binders are looked through.
+STATEMENT_GATE = """
+open Lean Elab Command Meta in
+run_cmd liftTermElabM do
+  let env <- getEnv
+  let unfold1 (e : Expr) : Expr :=
+    if e.isConst then
+      match env.constants.map₂.find? e.constName! with
+      | some (.defnInfo d) => d.value.instantiateLevelParams d.levelParams e.constLevels!
+      | _ => e
+    else e
+  let norm (e : Expr) : Expr := unfold1 (unfold1 (unfold1 (unfold1 e.consumeMData)))
+  let isLit (e : Expr) : Bool :=
+    let e := norm e
+    e.isConstOf ``True || e.isConstOf ``False || e.isAppOf ``sorryAx
+  let mut hits : Array Name := #[]
+  for (n, ci) in env.constants.map₂.toList do
+    let ty? : Option Expr := match ci with
+      | .thmInfo _ => some ci.type
+      | .defnInfo _ => some ci.type
+      | _ => none
+    match ty? with
+    | none => pure ()
+    | some ty =>
+      match (norm ty.getForallBody).iff? with
+      | some (l, _) => if isLit l then hits := hits.push n
+      | none => pure ()
+  unless hits.isEmpty do
+    let names := ", ".intercalate (hits.toList.take 5 |>.map toString)
+    throwError "statement form repudiated: {names} states an answer slot, a bare True, False or sorry as one side of an iff \
+(for example `(True : Prop) <-> P`). This verifier rejects that form because a free slot has to be policed from outside the \
+kernel: it can be filled with the hypothesis itself and closed by Iff.rfl, so a proof of it need not settle the question. State \
+the question as plain theorems instead (`theorem NAME : P` and, separately, `theorem NAME_neg : not (P)`) and prove whichever \
+holds. Why: https://github.com/leanprover/comparator#definition-holes (definition holes can be gamed and must always get an \
+additional check) and https://github.com/google-deepmind/formal-conjectures/blob/main/CONTRIBUTING.md#the-question-attribute \
+(the convention that replaced answer(sorry): the plain statement, negated when the answer is no)."
+"""
+
+
+VERDICT_REASONS = ("verified", "compile_error", "sorry", "rogue_axiom", "statement_form")
+
+
+def verdict_reason(lines) -> str:
+    """Why a script was refused, from its `Line N (Error|Warning): ...` lines, most specific first: the statement-form gate and the
+    axiom-closure gate name themselves in their messages; `sorry` is a warning; anything else is an ordinary compile error. A caller who
+    wants to know how often each gate refuses something reads the counts in /health (never the scripts: those are not kept)."""
+    joined = " ".join(lines)
+    if "statement form repudiated" in joined:
+        return "statement_form"
+    if "rogue axiom(s)" in joined:
+        return "rogue_axiom"
+    if re.search(r"declaration uses\s+[`']sorry[`']", joined):
+        return "sorry"
+    return "compile_error"
+
+
 class LeanCompilerDaemon:
     """One long-lived `lake serve` LSP subprocess, driven over stdio."""
 
@@ -152,6 +220,9 @@ class LeanCompilerDaemon:
         # cap and how often the file worker had to be replaced.
         self.verify_timeouts = 0
         self.worker_restarts = 0
+        # What the verifier has decided, by reason (VERDICT_REASONS): how often each gate refuses something is the evidence for what it is
+        # worth. Counts only; the scripts are not kept.
+        self.verdicts = {r: 0 for r in VERDICT_REASONS}
         self.last_verify_ms: int | None = None
         logger.info(f"🔧 [INIT] project_dir={self.project_dir!r}  uri={self.uri}")
         try:
@@ -417,7 +488,7 @@ class LeanCompilerDaemon:
             # what is actually SENT to the LSP: the user's script plus the axiom-closure
             # gate. `full_text` itself (without the gate) is still what gets persisted as
             # the certificate on success -- see the base64 marker below.
-            compiled_text = full_text + AXIOM_CHECK.strip() + "\n\n"
+            compiled_text = full_text + AXIOM_CHECK.strip() + "\n\n" + STATEMENT_GATE.strip() + "\n\n"
 
             preview = " ".join(script.strip().split())[:200]
             logger.info("─" * 60)
@@ -519,6 +590,8 @@ class LeanCompilerDaemon:
                 elapsed = int((time.time() - t0) * 1000)
                 self.last_verify_ms = elapsed
                 if not bad:
+                    if not warming:  # the warm-up script of a cold worker is not anyone's verdict
+                        self.verdicts["verified"] += 1
                     logger.info(f"✅ [#{n}] VERIFIED in {elapsed}ms — no errors/warnings")
                     # Callers persist "the script that got proved" as the final
                     # certificate — but they only ever see what THEY sent
@@ -546,7 +619,10 @@ class LeanCompilerDaemon:
                     m = " ".join(str(d.get("message", "")).split())
                     lines.append(f"Line {ln} ({sev}): {m}")
                     logger.info(f"❌ [#{n}] {lines[-1]}")
-                logger.info(f"❌ [#{n}] FAILED in {elapsed}ms — {len(bad)} issue(s)")
+                reason = verdict_reason(lines)
+                if not warming:
+                    self.verdicts[reason] += 1
+                logger.info(f"❌ [#{n}] FAILED in {elapsed}ms — {len(bad)} issue(s), reason={reason}")
                 return "❌ Compilation Failed:\n" + "\n".join(lines) + hint_block
 
             except WorkerCrashed as e:
@@ -842,6 +918,7 @@ async def _health_endpoint(request):
         "verifies": fast_compiler.verify_count,
         "verify_timeouts": fast_compiler.verify_timeouts,
         "worker_restarts": fast_compiler.worker_restarts,
+        "verdicts": dict(fast_compiler.verdicts),
         "last_verify_ms": fast_compiler.last_verify_ms,
         "warm": fast_compiler._warm,
         "verify_timeout_s": VERIFY_TIMEOUT,

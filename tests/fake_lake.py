@@ -7,6 +7,8 @@ the script text it is given.
   FAKE_SORRY     a severity-2 warning          -> failure (a hole)
   FAKE_ERROR     a severity-1 error            -> failure
   FAKE_HINT      a severity-3 "Try this: ..."  -> success with a suggestion
+  FAKE_REPUDIATED  the statement-form gate's error   -> failure
+  FAKE_ROGUE     the axiom-closure gate's error   -> failure
   FAKE_STUCK     no answer, ever: a worker busy in the kernel. The fake also runs
                  a child process named `lean --worker` that ignores `exit`, so the
                  daemon's kill path is exercised; the child's pid is written to
@@ -93,6 +95,10 @@ def answer(msg_id, uri, version, text):
         diags.append(diag(2, "declaration uses 'sorry'", 1))
     if "FAKE_ERROR" in text:
         diags.append(diag(1, "unsolved goals\n⊢ False", 2))
+    if "FAKE_REPUDIATED" in text:
+        diags.append(diag(1, "statement form repudiated: t states an answer slot, a bare True, False or sorry as one side of an iff", 4))
+    if "FAKE_ROGUE" in text:
+        diags.append(diag(1, "rogue axiom(s) introduced by this script (outside the standard trust set): [cheat]", 5))
     if "FAKE_HINT" in text:
         diags.append(diag(3, "Try this: exact Nat.add_zero n", 3))
     send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "version": version, "diagnostics": diags}})
