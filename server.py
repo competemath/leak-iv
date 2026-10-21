@@ -178,6 +178,23 @@ additional check) and https://github.com/google-deepmind/formal-conjectures/blob
 """
 
 
+VERDICT_REASONS = ("verified", "compile_error", "sorry", "rogue_axiom", "statement_form")
+
+
+def verdict_reason(lines) -> str:
+    """Why a script was refused, from its `Line N (Error|Warning): ...` lines, most specific first: the statement-form gate and the
+    axiom-closure gate name themselves in their messages; `sorry` is a warning; anything else is an ordinary compile error. A caller who
+    wants to know how often each gate refuses something reads the counts in /health (never the scripts: those are not kept)."""
+    joined = " ".join(lines)
+    if "statement form repudiated" in joined:
+        return "statement_form"
+    if "rogue axiom(s)" in joined:
+        return "rogue_axiom"
+    if re.search(r"declaration uses\s+[`']sorry[`']", joined):
+        return "sorry"
+    return "compile_error"
+
+
 class LeanCompilerDaemon:
     """One long-lived `lake serve` LSP subprocess, driven over stdio."""
 
@@ -203,6 +220,9 @@ class LeanCompilerDaemon:
         # cap and how often the file worker had to be replaced.
         self.verify_timeouts = 0
         self.worker_restarts = 0
+        # What the verifier has decided, by reason (VERDICT_REASONS): how often each gate refuses something is the evidence for what it is
+        # worth. Counts only; the scripts are not kept.
+        self.verdicts = {r: 0 for r in VERDICT_REASONS}
         self.last_verify_ms: int | None = None
         logger.info(f"🔧 [INIT] project_dir={self.project_dir!r}  uri={self.uri}")
         try:
@@ -570,6 +590,8 @@ class LeanCompilerDaemon:
                 elapsed = int((time.time() - t0) * 1000)
                 self.last_verify_ms = elapsed
                 if not bad:
+                    if not warming:  # the warm-up script of a cold worker is not anyone's verdict
+                        self.verdicts["verified"] += 1
                     logger.info(f"✅ [#{n}] VERIFIED in {elapsed}ms — no errors/warnings")
                     # Callers persist "the script that got proved" as the final
                     # certificate — but they only ever see what THEY sent
@@ -597,7 +619,10 @@ class LeanCompilerDaemon:
                     m = " ".join(str(d.get("message", "")).split())
                     lines.append(f"Line {ln} ({sev}): {m}")
                     logger.info(f"❌ [#{n}] {lines[-1]}")
-                logger.info(f"❌ [#{n}] FAILED in {elapsed}ms — {len(bad)} issue(s)")
+                reason = verdict_reason(lines)
+                if not warming:
+                    self.verdicts[reason] += 1
+                logger.info(f"❌ [#{n}] FAILED in {elapsed}ms — {len(bad)} issue(s), reason={reason}")
                 return "❌ Compilation Failed:\n" + "\n".join(lines) + hint_block
 
             except WorkerCrashed as e:
@@ -893,6 +918,7 @@ async def _health_endpoint(request):
         "verifies": fast_compiler.verify_count,
         "verify_timeouts": fast_compiler.verify_timeouts,
         "worker_restarts": fast_compiler.worker_restarts,
+        "verdicts": dict(fast_compiler.verdicts),
         "last_verify_ms": fast_compiler.last_verify_ms,
         "warm": fast_compiler._warm,
         "verify_timeout_s": VERIFY_TIMEOUT,

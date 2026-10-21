@@ -166,6 +166,35 @@ class DaemonCase(_Base):
         self.assertTrue(r.startswith("❌ Compilation Failed:"), r)
         self.assertIn("Line 3 (Error): unsolved goals ⊢ False", r)
 
+    async def test_every_verdict_is_counted_by_reason_and_shown_in_health(self):
+        """How often each gate refuses something is the evidence for what the gate is worth; /health carries the counts (never the scripts)."""
+        from starlette.testclient import TestClient
+        server.fast_compiler = self.d
+        for script in (
+            "theorem a : True := trivial",
+            "theorem a : True := trivial -- again",
+            "theorem b : False := by\n  simp\n  -- FAKE_ERROR",
+            "theorem c : True := by\n  sorry -- FAKE_SORRY",
+            "axiom cheat : False\ntheorem d : 1 = 2 := cheat.elim -- FAKE_ROGUE",
+            "theorem e : (True : Prop) <-> (1 = 1) := sorry -- FAKE_REPUDIATED",
+            "theorem e2 : (True : Prop) <-> (1 = 1) := sorry -- FAKE_REPUDIATED",
+        ):
+            await self.d.verify_script(script)
+        with TestClient(server.build_app()) as c:
+            h = c.get("/health").json()
+        self.assertEqual(h["verdicts"], {"verified": 2, "compile_error": 1, "sorry": 1, "rogue_axiom": 1, "statement_form": 2})
+        self.assertEqual(sum(h["verdicts"].values()), h["verifies"], "every verify is counted once")
+        self.assertNotIn("theorem", str(h["verdicts"]), "counts only, never a script")
+
+    def test_verdict_reason_prefers_the_gate_that_named_itself(self):
+        r = server.verdict_reason
+        self.assertEqual(r(["Line 9 (Error): statement form repudiated: t states ...", "Line 3 (Error): unsolved goals"]), "statement_form")
+        self.assertEqual(r(["Line 9 (Error): rogue axiom(s) introduced by this script: [cheat]"]), "rogue_axiom")
+        self.assertEqual(r(["Line 2 (Warning): declaration uses `sorry`"]), "sorry")
+        self.assertEqual(r(["Line 2 (Warning): declaration uses 'sorry'"]), "sorry")
+        self.assertEqual(r(["Line 3 (Error): unsolved goals"]), "compile_error")
+        self.assertEqual(set(server.VERDICT_REASONS), {"verified", "compile_error", "sorry", "rogue_axiom", "statement_form"})
+
     async def test_suggestions_are_harvested_without_touching_the_verdict(self):
         r = await self.d.verify_script("example (n : Nat) : n + 0 = n := by\n  exact?\n  -- FAKE_HINT")
         self.assertTrue(r.startswith(SUCCESS), r)
