@@ -21,3 +21,32 @@ jobs:
       - run: python -m py_compile server.py tests/fake_lake.py tests/fake_worker.py
       # the daemon against a fake `lake serve`: the callers' contract, crash recovery, the timeout fix, /health
       - run: python -m unittest discover -s tests -t . -v
+
+  # The two gates (axiom closure, statement form) compiled by REAL Lean. The fake `lake serve` above cannot tell whether a gate compiles or
+  # whether it rejects an ordinary proof; the first deployment of the axiom gate rejected `n + 0 = n := by simp`. Run on the toolchain the
+  # tree is on and on the next release, so a Lean upgrade is known to be safe for the gates before the tree is moved.
+  lean-gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - leanprover/lean4:v4.34.0-rc2 # what the tree is on now
+          - leanprover/lean4:v4.34.1
+          - leanprover/lean4:v4.35.0 # the next release: forward compatibility
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-test.txt
+      # the elan installer, pinned to a commit and a checksum (it installs only the elan binary; the toolchain comes next)
+      - run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/9605b24b08cf68b78dce0014b6fa01be1f8e2cee/elan-init.sh -o elan-init.sh
+          echo "a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53  elan-init.sh" | sha256sum -c -
+          sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - run: elan toolchain install ${{ matrix.toolchain }}
+      - run: LEAK_REQUIRE_LEAN=1 LEAK_LEAN_TOOLCHAIN=${{ matrix.toolchain }} python -m unittest tests.test_lean_gates -v
+

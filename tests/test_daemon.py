@@ -138,6 +138,17 @@ class DaemonCase(_Base):
         b64 = r.split("[[LEAK_NORMALIZED_SCRIPT_B64:")[1].split("]]")[0]
         self.assertNotIn("rogue axiom", base64.b64decode(b64).decode(), "the certificate is the user's script, not the gate")
 
+    async def test_the_statement_form_gate_is_sent_after_the_axiom_gate_but_not_persisted(self):
+        """The answer-slot form `(True : Prop) <-> P` is repudiated (2026-10): it is compiled after the user's script and the axiom gate,
+        and like the axiom gate it is not part of the saved certificate."""
+        r = await self.d.verify_script("theorem t : True := trivial")
+        sent = [e for e in lake_log() if e["method"] in ("textDocument/didOpen", "textDocument/didChange")][-1]["text"]
+        self.assertIn("statement form repudiated", sent)
+        self.assertTrue(sent.index("rogue axiom(s)") < sent.index("statement form repudiated"), "the statement gate follows the axiom gate")
+        self.assertTrue(sent.index("theorem t : True := trivial") < sent.index("statement form repudiated"), "and runs after the user's script")
+        b64 = r.split("[[LEAK_NORMALIZED_SCRIPT_B64:")[1].split("]]")[0]
+        self.assertNotIn("repudiated", base64.b64decode(b64).decode(), "the certificate is the user's script, not the gates")
+
     async def test_legacy_mathlib_import_is_rewritten_to_the_tree(self):
         r = await self.d.verify_script("import Mathlib\nimport Mathlib.Data.Nat.Basic\n\ntheorem t : True := trivial")
         self.assertTrue(r.startswith(SUCCESS), r)
@@ -321,6 +332,28 @@ class ConstantsCase(unittest.TestCase):
         self.assertIn("allowed.contains n", gate)
         # the allowlist is a literal list of names, not something built from the script
         self.assertIn("let allowed : List Name :=", gate)
+
+    def test_the_statement_form_gate_rejects_the_answer_slot_with_a_message_that_says_why_and_cites_sources(self):
+        gate = server.STATEMENT_GATE
+        # it looks only at what THIS script declared (nothing in the tree can trip it), at theorems and definitions, through leading
+        # binders and through definitions the script made, for an iff whose left side is a bare True, False or sorry
+        self.assertIn("env.constants.map₂", gate)
+        self.assertNotIn("env.constants.toList", gate, "all constants would include the whole tree")
+        for needle in (".thmInfo", ".defnInfo", "getForallBody", ".iff?", "``True", "``False", "``sorryAx", "unfold1", ".defnInfo"):
+            self.assertIn(needle, gate)
+        # it rejects by throwing, like the axiom gate, so the existing failure path carries it
+        self.assertIn("throwError", gate)
+        self.assertIn("statement form repudiated", gate)
+        # the message names the form, says why in one sentence, says what to write instead, and cites two primary sources
+        flat = " ".join(gate.split())
+        for needle in ("(True : Prop) <-> P", "filled with the hypothesis itself", "Iff.rfl", "theorem NAME : P", "theorem NAME_neg", "prove whichever holds"):
+            self.assertIn(needle, flat)
+        self.assertEqual(len(server.STATEMENT_GATE_SOURCES), 2)
+        for url in server.STATEMENT_GATE_SOURCES:
+            self.assertTrue(url.startswith("https://"), url)
+            self.assertIn(url, flat, "the message must carry the link")
+        self.assertIn("comparator#definition-holes", server.STATEMENT_GATE_SOURCES[0])
+        self.assertIn("formal-conjectures", server.STATEMENT_GATE_SOURCES[1])
 
     def test_warmup_has_its_own_long_ceiling_above_the_verify_cap(self):
         self.assertGreaterEqual(server.WARMUP_TIMEOUT, 600)
