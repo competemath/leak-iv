@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import os
 import signal
 import subprocess
@@ -84,7 +85,230 @@ TENGOKU_DIR = os.environ.get("LEAN_PROJECT_PATH", ".")
 # one-off warmup gets a much larger ceiling. If this is too small, the warmup
 # times out mid-load, the next verify's didChange restarts the load, and Mathlib
 # never becomes resident — which is exactly what made the daemon look "stuck".
-WARMUP_TIMEOUT = 1200.0
+WARMUP_TIMEOUT = float(os.environ.get("LEAK_WARMUP_TIMEOUT", "1200"))
+WARMUP_SCRIPT = "theorem warmup : 1 + 1 = 2 := by rfl"
+
+# ---- goals at every `sorry`, and the compiler's own messages ------------------------------------------------------------------------
+# A `sorry` is a warning and so a failure, and the warning names the declaration, not the hole: a caller that scaffolded a proof with
+# `sorry`s got nothing back but "declaration uses sorry" (the LRR Control II transcripts, 2026-08: a median 6.5 such warnings per
+# unsolved item, every one of them empty). After the diagnostics are in, the daemon asks the file worker for the goal at each `sorry`
+# of the script ($/lean/plainGoal for a tactic sorry, $/lean/plainTermGoal for a term one) and returns them in a [[LEAK_GOALS]]
+# block, one entry per hole, hypotheses and goal on their own lines; an error that carries a goal state (`unsolved goals`, an unfilled
+# `?_`) is repeated there unflattened. Severity-3 messages that are not tactic suggestions (`#eval`, `#check`, `trace_state`, `#print`)
+# come back in a [[LEAK_INFO]] block. Neither block touches the verdict or the "Line N (Error|Warning):" grammar the callers parse,
+# neither is persisted, and both are capped. The goal queries share one small ceiling (LEAK_GOAL_TIMEOUT): past it the answer goes
+# out with the goals it has. The verdict never waits on a goal.
+GOAL_QUERY_TIMEOUT = float(os.environ.get("LEAK_GOAL_TIMEOUT", "20"))
+GOAL_MAX_SORRIES = int(os.environ.get("LEAK_GOAL_MAX_SORRIES", "24"))
+BLOCK_MAX_CHARS = int(os.environ.get("LEAK_BLOCK_MAX_CHARS", "24000"))
+# errors whose message is a goal state
+GOAL_ERROR_RE = re.compile(r"^(unsolved goals|don't know how to synthesize placeholder)", re.I)
+_SORRY_TOKEN = re.compile(r"(?<![\w.'«»])sorry(?![\w'«»])")
+
+
+def sorry_positions(text: str) -> list[tuple[int, int]]:
+    """(line, character), both 0-based, of every `sorry` token of `text` that is code: not inside a `--` comment, a `/- -/` block
+    (nested, as Lean nests them) or a string literal. `sorryAx` and `«sorry»` are not the token."""
+    out: list[tuple[int, int]] = []
+    depth = 0  # block-comment nesting carried across lines
+    for ln, line in enumerate(text.split("\n")):
+        spans: list[tuple[int, int]] = []
+        start: int | None = 0 if depth == 0 else None
+        in_str = False
+        i = 0
+        while i < len(line):
+            if depth > 0:
+                if line.startswith("-/", i):
+                    depth -= 1
+                    i += 2
+                    if depth == 0:
+                        start = i
+                    continue
+                if line.startswith("/-", i):
+                    depth += 1
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if in_str:
+                if line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == '"':
+                    in_str = False
+                    start = i + 1
+                i += 1
+                continue
+            if line[i] == '"':
+                if start is not None:
+                    spans.append((start, i))
+                start = None
+                in_str = True
+                i += 1
+                continue
+            if line.startswith("--", i):
+                if start is not None:
+                    spans.append((start, i))
+                start = None
+                break
+            if line.startswith("/-", i):
+                if start is not None:
+                    spans.append((start, i))
+                start = None
+                depth += 1
+                i += 2
+                continue
+            i += 1
+        if start is not None and not in_str:
+            spans.append((start, len(line)))
+        for a, b in spans:
+            for m in _SORRY_TOKEN.finditer(line, a, b):
+                out.append((ln, m.start()))
+    return out
+
+
+def render_plain_goal(res) -> str:
+    """The text of a $/lean/plainGoal result: the goals, or the rendered block without its code fence; "" when there is none."""
+    if not isinstance(res, dict):
+        return ""
+    goals = res.get("goals")
+    if isinstance(goals, list):
+        parts = [str(g).strip() for g in goals if str(g).strip()]
+        if parts:
+            return "\n\n".join(parts)
+    rendered = str(res.get("rendered") or "").strip()
+    rendered = re.sub(r"^```\w*\n?", "", rendered)
+    rendered = re.sub(r"\n?```$", "", rendered)
+    return rendered.strip()
+
+
+def render_term_goal(res) -> str:
+    """The text of a $/lean/plainTermGoal result (the expected type of a term-mode hole); "" when there is none."""
+    if not isinstance(res, dict):
+        return ""
+    return str(res.get("goal") or "").strip()
+
+
+def quote_block(text: str) -> str:
+    """Multi-line content for the [[LEAK_GOALS]] / [[LEAK_INFO]] blocks: every line prefixed, so no line of it can match the
+    "Line N (Error|Warning):" grammar or the "Suggestion @"/"[[" markers a caller parses, and the compiler's own phrases a caller
+    tests the verdict by ("Compilation Successful", "Compilation Failed", "100% verified") are disarmed."""
+    text = str(text).replace("❌", "(x)").replace("✅", "(ok)").replace("[[", "[ [")
+    text = re.sub(r"(?i)compilation (successful|failed)", r"compilation_\1", text)
+    text = text.replace("100% verified", "100%_verified")
+    return "\n".join("  | " + ln for ln in text.split("\n"))
+
+
+def cap_block(block: str) -> str:
+    if len(block) <= BLOCK_MAX_CHARS:
+        return block
+    return block[:BLOCK_MAX_CHARS] + f"\n  | … [truncated: {len(block) - BLOCK_MAX_CHARS} more characters]"
+
+
+AXIOM_CHECK = """
+-- Jinshi/Leak axiom-closure gate (2026-10): a clean LSP compile only means
+-- "no error/warning diagnostic", and Lean does not warn on a freshly
+-- declared `axiom` the way it warns on `sorry` -- so `axiom cheat : False`
+-- followed by `cheat.elim` compiled clean and was reported 100% verified for
+-- ANY target statement. This block runs after the user's script and checks
+-- what the finished environment actually rests on: only the three standard
+-- Mathlib/Lean axioms (propext, Classical.choice, Quot.sound) and the two
+-- native_decide oracle axioms (Lean.ofReduceBool, Lean.trustCompiler) are
+-- permitted. Anything else is a `throwError`, which surfaces as an ordinary
+-- severity-1 diagnostic -- the existing `bad` filter below already treats
+-- that as a failed verification, so no other code path changes.
+open Lean Elab Command in
+run_cmd do
+  let env <- getEnv
+  let allowed : List Name :=
+    -- the first five are the standard Mathlib/Lean trust set and the native_decide oracle;
+    -- the rest are compiler-internal markers (erasure/proof-irrelevance/unreachable-code
+    -- stand-ins, `sorryAx` itself, the Nat-reducing native oracle) that Lean declares as
+    -- axioms in EVERY environment regardless of what a script does -- confirmed empirically
+    -- against this exact toolchain + Tengoku import on 2026-10-07 (the first deployment of
+    -- this gate rejected `n + 0 = n := by simp`, a completely ordinary proof, over exactly
+    -- these always-present names; `sorryAx` being merely DECLARED is harmless -- actual
+    -- `sorry` use is independently caught by the severity-2 diagnostic this daemon already
+    -- treats as a failure, a different and unrelated mechanism from this axiom-closure gate).
+    [`propext, `Classical.choice, `Quot.sound, `Lean.ofReduceBool, `Lean.trustCompiler,
+     `Lean.ofReduceNat, `sorryAx, `lcAny, `lcProof, `lcErased, `lcCast, `lcVoid,
+     `lcUnreachable, `Quot.lcInv, `isScalarObj]
+  let rogue := env.constants.toList.filterMap fun (n, ci) =>
+    match ci with
+    | .axiomInfo _ => if allowed.contains n then none else some n
+    | _ => none
+  if !rogue.isEmpty then
+    throwError "rogue axiom(s) introduced by this script (outside the standard Mathlib/Lean \
+trust set and the native_decide oracle): {rogue}"
+"""
+
+
+STATEMENT_GATE_SOURCES = (
+    "https://github.com/leanprover/comparator#definition-holes",
+    "https://github.com/google-deepmind/formal-conjectures/blob/main/CONTRIBUTING.md#the-question-attribute",
+)
+
+# The answer-slot form `(True : Prop) <-> P`, `(False : Prop) <-> P`, `(sorry : Prop) <-> P` is repudiated (2026-10). A statement written
+# with a free Prop slot has to be policed from outside the kernel: the slot can be filled with the hypothesis itself and closed by
+# `Iff.rfl`, which is why the Lean community's comparator says such definition holes "can be gamed" and must always get an additional
+# check, and why formal-conjectures dropped `answer(sorry)` for the plain statement, negated with a not-sign when the answer is no. So a
+# question is stated as plain theorems (`theorem NAME : P`, and separately `theorem NAME_neg : not (P)`), and a theorem whose
+# statement is an iff with a bare True, False or sorry on its left is an error with this message. Only declarations this script
+# added are looked at (`map2` of the constant map), so nothing in the tree can trip it; a definition such as `def S : Prop := True`
+# is looked through, so `theorem t : S <-> P` is caught too; leading forall binders are looked through.
+STATEMENT_GATE = """
+open Lean Elab Command Meta in
+run_cmd liftTermElabM do
+  let env <- getEnv
+  let unfold1 (e : Expr) : Expr :=
+    if e.isConst then
+      match env.constants.map₂.find? e.constName! with
+      | some (.defnInfo d) => d.value.instantiateLevelParams d.levelParams e.constLevels!
+      | _ => e
+    else e
+  let norm (e : Expr) : Expr := unfold1 (unfold1 (unfold1 (unfold1 e.consumeMData)))
+  let isLit (e : Expr) : Bool :=
+    let e := norm e
+    e.isConstOf ``True || e.isConstOf ``False || e.isAppOf ``sorryAx
+  let mut hits : Array Name := #[]
+  for (n, ci) in env.constants.map₂.toList do
+    let ty? : Option Expr := match ci with
+      | .thmInfo _ => some ci.type
+      | .defnInfo _ => some ci.type
+      | _ => none
+    match ty? with
+    | none => pure ()
+    | some ty =>
+      match (norm ty.getForallBody).iff? with
+      | some (l, _) => if isLit l then hits := hits.push n
+      | none => pure ()
+  unless hits.isEmpty do
+    let names := ", ".intercalate (hits.toList.take 5 |>.map toString)
+    throwError "statement form repudiated: {names} states an answer slot, a bare True, False or sorry as one side of an iff \
+(for example `(True : Prop) <-> P`). This verifier rejects that form because a free slot has to be policed from outside the \
+kernel: it can be filled with the hypothesis itself and closed by Iff.rfl, so a proof of it need not settle the question. State \
+the question as plain theorems instead (`theorem NAME : P` and, separately, `theorem NAME_neg : not (P)`) and prove whichever \
+holds. Why: https://github.com/leanprover/comparator#definition-holes (definition holes can be gamed and must always get an \
+additional check) and https://github.com/google-deepmind/formal-conjectures/blob/main/CONTRIBUTING.md#the-question-attribute \
+(the convention that replaced answer(sorry): the plain statement, negated when the answer is no)."
+"""
+
+
+VERDICT_REASONS = ("verified", "compile_error", "sorry", "rogue_axiom", "statement_form")
+
+
+def verdict_reason(lines) -> str:
+    """Why a script was refused, from its `Line N (Error|Warning): ...` lines, most specific first: the statement-form gate and the
+    axiom-closure gate name themselves in their messages; `sorry` is a warning; anything else is an ordinary compile error. A caller who
+    wants to know how often each gate refuses something reads the counts in /health (never the scripts: those are not kept)."""
+    joined = " ".join(lines)
+    if "statement form repudiated" in joined:
+        return "statement_form"
+    if "rogue axiom(s)" in joined:
+        return "rogue_axiom"
+    if re.search(r"declaration uses\s+[`']sorry[`']", joined):
+        return "sorry"
+    return "compile_error"
 
 
 class LeanCompilerDaemon:
@@ -97,16 +321,28 @@ class LeanCompilerDaemon:
         # Tripped by the stderr watcher when the file worker prints a native
         # abort, so the read loop can bail out immediately instead of hanging.
         self._crash_event = asyncio.Event()
+        # The one read in flight on the LSP stdout. A wait that times out must NOT cancel it: a message half-read (its header
+        # consumed, its body not) would leave every later read parsing a body as headers. The read stays pending and the next
+        # wait takes it over. Dropped when the process is replaced.
+        self._read_fut: asyncio.Future | None = None
         self.version = 1                    # monotonic LSP document version
         self.request_id = 1000              # monotonic LSP request id
         self.verify_count = 0               # for log correlation
         self.sandbox_path = Path(self.project_dir).resolve() / "virtual_sandbox.lean"
         self.uri = self.sandbox_path.as_uri()
-        self._is_file_open = False
+        self._is_file_open = self._warm = False
+        # Warm = the current file worker has answered at least one request, so the Tengoku tree is loaded in it. A fresh worker
+        # needs ~200 s to load it (more on a loaded CPU), longer than the 180 s a verify may take: charged to a script, a cold
+        # start looked like "verify exceeded 180s", and the next request's didChange restarted the load, so with clients retrying
+        # it never finished (2026-10-20: 25 min, then three hours). A cold worker is therefore warmed first, with its own ceiling.
+        self._warm = False
         # Counters a reader of /health can watch: how often a script ran past the
         # cap and how often the file worker had to be replaced.
         self.verify_timeouts = 0
         self.worker_restarts = 0
+        # What the verifier has decided, by reason (VERDICT_REASONS): how often each gate refuses something is the evidence for what it is
+        # worth. Counts only; the scripts are not kept.
+        self.verdicts = {r: 0 for r in VERDICT_REASONS}
         self.last_verify_ms: int | None = None
         logger.info(f"🔧 [INIT] project_dir={self.project_dir!r}  uri={self.uri}")
         try:
@@ -131,6 +367,7 @@ class LeanCompilerDaemon:
             start_new_session=True,
         )
         asyncio.create_task(self._log_stderr())
+        self._read_fut = None
         await self._send("initialize", {
             "processId": os.getpid(),
             "rootUri": Path(self.project_dir).resolve().as_uri(),
@@ -142,7 +379,7 @@ class LeanCompilerDaemon:
                 logger.info("✅ [BOOT] initialize handshake complete")
                 break
         await self._send("initialized", {})
-        self._is_file_open = False
+        self._is_file_open = self._warm = False
         logger.info("✅ [BOOT] daemon online")
 
     async def _log_stderr(self):
@@ -199,25 +436,81 @@ class LeanCompilerDaemon:
         waitForDiagnostics, so a plain read would block for the full timeout —
         exactly the 3-minute hang from the 2026-07-12 outage. We race the read
         against the crash signal the stderr watcher sets on 'Aborting.'."""
-        read_fut = asyncio.ensure_future(self._read())
+        if self._read_fut is None or (self._read_fut.done() and self._read_fut.cancelled()):
+            self._read_fut = asyncio.ensure_future(self._read())
+        read_fut = self._read_fut
         crash_fut = asyncio.ensure_future(self._crash_event.wait())
         try:
             done, _ = await asyncio.wait(
                 {read_fut, crash_fut}, timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED)
             if read_fut in done:
+                self._read_fut = None
                 return read_fut.result()          # normal message (or raises EOF/etc.)
             if crash_fut in done:
                 raise WorkerCrashed("file worker aborted (native stack overflow)")
             raise TimeoutError(f"verify exceeded {timeout:.0f}s")
         finally:
-            for f in (read_fut, crash_fut):
-                if not f.done():
-                    f.cancel()
+            # the read is left in flight (see _read_fut); only the crash wait is cancelled
+            if not crash_fut.done():
+                crash_fut.cancel()
+            try:
+                await crash_fut
+            except BaseException:
+                pass  # swallow the cancellation / already-handled exception
+
+    async def _query_goals(self, full_text: str, deadline: float, n: int) -> list[tuple[int, str]]:
+        """The goal at every `sorry` of `full_text`, as (0-based line, text), from the file worker that has just elaborated it:
+        $/lean/plainGoal, then $/lean/plainTermGoal where that gave nothing (a term-mode sorry). Bounded by `deadline` (a wall-clock
+        time): what has not answered by then is left out, and its request stays pending (a late answer is ignored by the next verify,
+        which only looks for its own ids). A worker crash here is logged and ends the queries; the verdict already in hand stands,
+        and the next verify finds and replaces the dead worker."""
+        positions = sorry_positions(full_text)
+        if not positions:
+            return []
+        if len(positions) > GOAL_MAX_SORRIES:
+            logger.info(f"🎯 [#{n}] {len(positions)} sorries; asking for the first {GOAL_MAX_SORRIES}")
+            positions = positions[:GOAL_MAX_SORRIES]
+        pending: dict[int, tuple[int, int, str]] = {}
+
+        async def ask(method: str, ln: int, ch: int):
+            self.request_id += 1
+            pending[self.request_id] = (ln, ch, method)
+            await self._send(method, {"textDocument": {"uri": self.uri}, "position": {"line": ln, "character": ch}},
+                             msg_id=self.request_id)
+
+        found: dict[tuple[int, int], str] = {}
+        try:
+            for ln, ch in positions:
+                await ask("$/lean/plainGoal", ln, ch)
+            while pending:
+                left = deadline - time.time()
+                if left <= 0:
+                    break
                 try:
-                    await f
-                except BaseException:
-                    pass  # swallow the cancellation / already-handled exception
+                    msg = await self._await_message(left)
+                except TimeoutError:
+                    break
+                mid = msg.get("id")
+                if "method" in msg or mid not in pending:
+                    continue  # a notification, or an answer to something else
+                ln, ch, method = pending.pop(mid)
+                res = None if "error" in msg else msg.get("result")
+                if method == "$/lean/plainGoal":
+                    text = render_plain_goal(res)
+                    if text:
+                        found[(ln, ch)] = text
+                    else:
+                        await ask("$/lean/plainTermGoal", ln, ch)
+                else:
+                    text = render_term_goal(res)
+                    if text:
+                        found[(ln, ch)] = text
+        except WorkerCrashed as e:
+            logger.error(f"💥 [#{n}] worker crashed while answering goal queries: {e} (the verdict stands; the next verify replaces it)")
+        if pending:
+            logger.info(f"⏱️  [#{n}] {len(pending)} goal quer(y/ies) unanswered within the goal ceiling; answered without them")
+        return [(ln, found[(ln, ch)]) for ln, ch in positions if (ln, ch) in found]
 
     def _worker_pids(self) -> list[int]:
         """The `lean --worker` processes the watchdog forked: descendants of the
@@ -302,7 +595,7 @@ class LeanCompilerDaemon:
         self.worker_restarts += 1
         if not self.process or self.process.returncode is not None:
             self.process = None
-            self._is_file_open = False
+            self._is_file_open = self._warm = False
             logger.error(f"♻️  [#{n}] watchdog gone — full reboot armed for next call")
             return
         try:
@@ -311,16 +604,29 @@ class LeanCompilerDaemon:
                                  {"textDocument": {"uri": self.uri}})
         except Exception:
             self.process = None            # watchdog stdin dead → reboot next call
-            self._is_file_open = False
+            self._is_file_open = self._warm = False
             return
-        self._is_file_open = False
+        self._is_file_open = self._warm = False
         await self._kill_workers(n)
         logger.info(f"♻️  [#{n}] file-worker respawn armed after {reason} (didClose sent; next verify re-opens)")
 
     # ---- the one public operation -----------------------------------------
     async def verify_script(self, script: str, timeout: float = VERIFY_TIMEOUT) -> str:
         async with self.lock:
-            self.verify_count += 1
+            if not self._warm:
+                # A new or replaced worker: load the tree first, under the long ceiling, so the script is not charged for it
+                # and nothing that arrives meanwhile restarts the load.
+                logger.info("🌡️  cold file worker — warming before this script")
+                await self._verify(WARMUP_SCRIPT, WARMUP_TIMEOUT, lock_held=True, warming=True)
+                if not self._warm:
+                    return ("❌ Verification Error: the verifier is still loading the Tengoku tree after a restart "
+                            "(it takes a few minutes). Nothing was checked. Try again shortly.")
+            return await self._verify(script, timeout, lock_held=True)
+
+    async def _verify(self, script: str, timeout: float, *, lock_held: bool = False, warming: bool = False) -> str:
+        async with (contextlib.nullcontext() if lock_held else self.lock):
+            if not warming:
+                self.verify_count += 1
             n = self.verify_count
             t0 = time.time()
 
@@ -356,6 +662,10 @@ class LeanCompilerDaemon:
             full_text = (
                 script if re.search(r"^[ \t]*import[ \t]+Tengoku\b", script, re.M) else f"{TENGOKU_IMPORTS}\n\n{script}"
             ).strip() + "\n\n"
+            # what is actually SENT to the LSP: the user's script plus the axiom-closure
+            # gate. `full_text` itself (without the gate) is still what gets persisted as
+            # the certificate on success -- see the base64 marker below.
+            compiled_text = full_text + AXIOM_CHECK.strip() + "\n\n" + STATEMENT_GATE.strip() + "\n\n"
 
             preview = " ".join(script.strip().split())[:200]
             logger.info("─" * 60)
@@ -369,12 +679,12 @@ class LeanCompilerDaemon:
                 if not self._is_file_open:
                     await self._send("textDocument/didOpen", {"textDocument": {
                         "uri": self.uri, "languageId": "lean",
-                        "version": ver, "text": full_text}})
+                        "version": ver, "text": compiled_text}})
                     self._is_file_open = True
                 else:
                     await self._send("textDocument/didChange", {
                         "textDocument": {"uri": self.uri, "version": ver},
-                        "contentChanges": [{"text": full_text}]})
+                        "contentChanges": [{"text": compiled_text}]})
 
                 # Lean's synchronisation primitive: this request only gets a
                 # response once ALL diagnostics for `ver` have been emitted.
@@ -401,6 +711,7 @@ class LeanCompilerDaemon:
                                 raise WorkerCrashed(f"waitForDiagnostics: {err}")
                             raise RuntimeError(
                                 f"waitForDiagnostics error: {msg['error']}")
+                        self._warm = True
                         logger.info(f"🏁 [#{n}] waitForDiagnostics returned "
                                     f"({publishes} publishes merged)")
                         break
@@ -433,29 +744,36 @@ class LeanCompilerDaemon:
                 # the promise is a hole-free proof, and a warning here is a hole.
                 bad = [d for d in diags if d.get("severity", 1) in (1, 2)]
 
-                # `apply?` / `exact?` / `rw?` / `simp?` report their hits as
-                # severity-3 INFORMATION ("Try this: exact Nat.add_zero n"),
-                # which this filter dropped — so a caller could run apply? and
-                # never read the answer. They are ADVISORY: collected here, they
-                # never touch the pass/fail verdict, and the format deliberately
-                # does NOT match the "Line N (Error|Warning):" grammar callers
-                # parse, so no existing consumer changes behaviour.
-                hints = []
+                # Severity-3 INFORMATION. `apply?` / `exact?` / `rw?` / `simp?`
+                # report their hits as "Try this: exact Nat.add_zero n": those go
+                # behind [[LEAK_SUGGESTIONS]], which callers already read. Every
+                # other info message (`#eval`, `#check`, `trace_state`, `#print`
+                # output) goes behind [[LEAK_INFO]]. Both are ADVISORY: they never
+                # touch the pass/fail verdict, and neither format matches the
+                # "Line N (Error|Warning):" grammar callers parse.
+                hints, infos = [], []
                 for d in diags:
                     if d.get("severity") != 3:
                         continue
-                    m = " ".join(str(d.get("message", "")).split())
-                    if not m.lower().startswith("try this"):
-                        continue
+                    raw = str(d.get("message", ""))
+                    m = " ".join(raw.split())
                     ln = d.get("range", {}).get("start", {}).get("line", 0) + 1
-                    hints.append(f"Suggestion @ line {ln}: {m}")
+                    if m.lower().startswith("try this"):
+                        hints.append(f"Suggestion @ line {ln}: {m}")
+                    else:
+                        infos.append(f"Info @ line {ln}:\n{quote_block(raw.strip())}")
                 hint_block = ("\n[[LEAK_SUGGESTIONS]]\n" + "\n".join(hints)) if hints else ""
+                info_block = cap_block("\n[[LEAK_INFO]]\n" + "\n".join(infos)) if infos else ""
                 if hints:
                     logger.info(f"💡 [#{n}] {len(hints)} tactic suggestion(s) harvested")
+                if infos:
+                    logger.info(f"ℹ️  [#{n}] {len(infos)} info message(s) returned")
 
                 elapsed = int((time.time() - t0) * 1000)
                 self.last_verify_ms = elapsed
                 if not bad:
+                    if not warming:  # the warm-up script of a cold worker is not anyone's verdict
+                        self.verdicts["verified"] += 1
                     logger.info(f"✅ [#{n}] VERIFIED in {elapsed}ms — no errors/warnings")
                     # Callers persist "the script that got proved" as the final
                     # certificate — but they only ever see what THEY sent
@@ -473,7 +791,7 @@ class LeanCompilerDaemon:
                     return (
                         "✅ Compilation Successful! The proof is 100% verified.\n"
                         f"[[LEAK_NORMALIZED_SCRIPT_B64:{normalized_b64}]]"
-                        f"{hint_block}"
+                        f"{info_block}{hint_block}"
                     )
 
                 lines = []
@@ -483,8 +801,29 @@ class LeanCompilerDaemon:
                     m = " ".join(str(d.get("message", "")).split())
                     lines.append(f"Line {ln} ({sev}): {m}")
                     logger.info(f"❌ [#{n}] {lines[-1]}")
-                logger.info(f"❌ [#{n}] FAILED in {elapsed}ms — {len(bad)} issue(s)")
-                return "❌ Compilation Failed:\n" + "\n".join(lines) + hint_block
+                reason = verdict_reason(lines)
+                if not warming:
+                    self.verdicts[reason] += 1
+                logger.info(f"❌ [#{n}] FAILED in {elapsed}ms — {len(bad)} issue(s), reason={reason}")
+
+                # The goal at every hole, after the verdict is settled: errors that
+                # ARE a goal state (`unsolved goals`, an unfilled `?_`) repeated
+                # with their line breaks, then the goal at each `sorry`, asked of
+                # the worker under its own small ceiling (never the verify cap).
+                goals = []
+                for d in bad:
+                    raw = str(d.get("message", "")).strip()
+                    if d.get("severity", 1) == 1 and GOAL_ERROR_RE.match(raw):
+                        ln = d.get("range", {}).get("start", {}).get("line", 0) + 1
+                        goals.append(f"Goal @ line {ln} (error):\n{quote_block(raw)}")
+                if not warming:
+                    goal_deadline = min(t0 + timeout, time.time() + GOAL_QUERY_TIMEOUT)
+                    for ln, text in await self._query_goals(full_text, goal_deadline, n):
+                        goals.append(f"Goal @ line {ln + 1} (sorry):\n{quote_block(text)}")
+                goal_block = cap_block("\n[[LEAK_GOALS]]\n" + "\n".join(goals)) if goals else ""
+                if goals:
+                    logger.info(f"🎯 [#{n}] {len(goals)} goal state(s) returned")
+                return "❌ Compilation Failed:\n" + "\n".join(lines) + goal_block + info_block + hint_block
 
             except WorkerCrashed as e:
                 # The file worker aborted but the daemon is NOT dead: respawn the
@@ -503,19 +842,20 @@ class LeanCompilerDaemon:
                 self.verify_timeouts += 1
                 logger.error(f"⏱️  [#{n}] {e} — replacing the file worker")
                 await self._recover_worker(n, reason="timeout")
+                if warming:
+                    return f"❌ Verification Error: the tree did not load within {timeout:.0f}s ({e})."
                 return (f"❌ Verification Error: {e}. The Lean worker was stopped so that "
-                        "the next script starts fresh. Do not resubmit this script as it "
-                        "is: what runs this long is almost always a kernel evaluation on a "
-                        "large numeral (`decide`, `decide +kernel`, `native_decide`, `rfl` "
-                        "on big values), which cannot be interrupted. Prove the statement "
-                        "structurally, or shrink the numeral.")
+                        "the next script starts on a fresh one (loaded before it runs). Do not "
+                        "resubmit this script as it is. If it asks the kernel to evaluate a large "
+                        "numeral (`decide`, `decide +kernel`, `native_decide`, `rfl` on big values) "
+                        "that cannot be interrupted: prove the statement structurally instead.")
 
             except Exception as e:
                 logger.error(f"💥 [#{n}] {traceback.format_exc()}")
                 # A dead pipe/EOF means the LSP crashed — force a reboot next call.
                 if isinstance(e, (EOFError, BrokenPipeError)):
                     self.process = None
-                    self._is_file_open = False
+                    self._is_file_open = self._warm = False
                     logger.error(f"♻️  [#{n}] LSP marked for reboot")
                 return f"❌ Verification Error: {e}"
 
@@ -547,6 +887,17 @@ async def verify_full_script(script: str) -> str:
     A caller that persists "the proof" should decode and store this instead of
     its own `script` argument, so the saved artifact is self-contained and
     doesn't silently depend on this daemon's injection to compile standalone.
+
+    WORKING INCREMENTALLY: a failed compile also carries the goal at every hole.
+    Leave `sorry` where a step is not written yet and the answer ends with a
+    [[LEAK_GOALS]] block giving, for each `sorry`, the hypotheses and the goal at
+    that point (and the same for every `unsolved goals` error and unfilled `?_`,
+    with their line breaks kept). So: write the skeleton, read the goals, fill one
+    hole, resubmit. Output of `#eval`, `#check`, `trace_state` and `#print` comes
+    back in a [[LEAK_INFO]] block, so a probe script is a way to ask the
+    environment a question. `exact?`/`apply?` hits come back under
+    [[LEAK_SUGGESTIONS]]. None of these blocks changes the verdict: a script with
+    a `sorry` in it still fails, and only a sorry-free success counts.
     """
     try:
         return await fast_compiler.verify_script(script)
@@ -756,9 +1107,12 @@ async def _warmup():
     logger.info("⏳ Warmup: cold-loading the Tengoku tree into the elaborator "
                 "(first load can take several minutes on a small CPU)…")
     try:
-        r = await fast_compiler.verify_script(
-            "theorem warmup : 1 + 1 = 2 := by rfl", timeout=WARMUP_TIMEOUT)
-        logger.info(f"✅ Warmup complete — Tengoku resident. Result: {r}")
+        async with fast_compiler.lock:
+            if not fast_compiler._warm:
+                r = await fast_compiler._verify(WARMUP_SCRIPT, WARMUP_TIMEOUT, lock_held=True, warming=True)
+            else:
+                r = "already warm"
+        logger.info(f"✅ Warmup complete — Tengoku resident. Result: {r[:80]}")
     except Exception as e:
         logger.error(f"⚠️  Warmup did not finish: {e}")
 
@@ -775,7 +1129,9 @@ async def _health_endpoint(request):
         "verifies": fast_compiler.verify_count,
         "verify_timeouts": fast_compiler.verify_timeouts,
         "worker_restarts": fast_compiler.worker_restarts,
+        "verdicts": dict(fast_compiler.verdicts),
         "last_verify_ms": fast_compiler.last_verify_ms,
+        "warm": fast_compiler._warm,
         "verify_timeout_s": VERIFY_TIMEOUT,
         "busy": fast_compiler.lock.locked(),
     })
