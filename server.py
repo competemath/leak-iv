@@ -88,6 +88,122 @@ TENGOKU_DIR = os.environ.get("LEAN_PROJECT_PATH", ".")
 WARMUP_TIMEOUT = float(os.environ.get("LEAK_WARMUP_TIMEOUT", "1200"))
 WARMUP_SCRIPT = "theorem warmup : 1 + 1 = 2 := by rfl"
 
+# ---- goals at every `sorry`, and the compiler's own messages ------------------------------------------------------------------------
+# A `sorry` is a warning and so a failure, and the warning names the declaration, not the hole: a caller that scaffolded a proof with
+# `sorry`s got nothing back but "declaration uses sorry" (the LRR Control II transcripts, 2026-08: a median 6.5 such warnings per
+# unsolved item, every one of them empty). After the diagnostics are in, the daemon asks the file worker for the goal at each `sorry`
+# of the script ($/lean/plainGoal for a tactic sorry, $/lean/plainTermGoal for a term one) and returns them in a [[LEAK_GOALS]]
+# block, one entry per hole, hypotheses and goal on their own lines; an error that carries a goal state (`unsolved goals`, an unfilled
+# `?_`) is repeated there unflattened. Severity-3 messages that are not tactic suggestions (`#eval`, `#check`, `trace_state`, `#print`)
+# come back in a [[LEAK_INFO]] block. Neither block touches the verdict or the "Line N (Error|Warning):" grammar the callers parse,
+# neither is persisted, and both are capped. The goal queries share one small ceiling (LEAK_GOAL_TIMEOUT): past it the answer goes
+# out with the goals it has. The verdict never waits on a goal.
+GOAL_QUERY_TIMEOUT = float(os.environ.get("LEAK_GOAL_TIMEOUT", "20"))
+GOAL_MAX_SORRIES = int(os.environ.get("LEAK_GOAL_MAX_SORRIES", "24"))
+BLOCK_MAX_CHARS = int(os.environ.get("LEAK_BLOCK_MAX_CHARS", "24000"))
+# errors whose message is a goal state
+GOAL_ERROR_RE = re.compile(r"^(unsolved goals|don't know how to synthesize placeholder)", re.I)
+_SORRY_TOKEN = re.compile(r"(?<![\w.'«»])sorry(?![\w'«»])")
+
+
+def sorry_positions(text: str) -> list[tuple[int, int]]:
+    """(line, character), both 0-based, of every `sorry` token of `text` that is code: not inside a `--` comment, a `/- -/` block
+    (nested, as Lean nests them) or a string literal. `sorryAx` and `«sorry»` are not the token."""
+    out: list[tuple[int, int]] = []
+    depth = 0  # block-comment nesting carried across lines
+    for ln, line in enumerate(text.split("\n")):
+        spans: list[tuple[int, int]] = []
+        start: int | None = 0 if depth == 0 else None
+        in_str = False
+        i = 0
+        while i < len(line):
+            if depth > 0:
+                if line.startswith("-/", i):
+                    depth -= 1
+                    i += 2
+                    if depth == 0:
+                        start = i
+                    continue
+                if line.startswith("/-", i):
+                    depth += 1
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if in_str:
+                if line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == '"':
+                    in_str = False
+                    start = i + 1
+                i += 1
+                continue
+            if line[i] == '"':
+                if start is not None:
+                    spans.append((start, i))
+                start = None
+                in_str = True
+                i += 1
+                continue
+            if line.startswith("--", i):
+                if start is not None:
+                    spans.append((start, i))
+                start = None
+                break
+            if line.startswith("/-", i):
+                if start is not None:
+                    spans.append((start, i))
+                start = None
+                depth += 1
+                i += 2
+                continue
+            i += 1
+        if start is not None and not in_str:
+            spans.append((start, len(line)))
+        for a, b in spans:
+            for m in _SORRY_TOKEN.finditer(line, a, b):
+                out.append((ln, m.start()))
+    return out
+
+
+def render_plain_goal(res) -> str:
+    """The text of a $/lean/plainGoal result: the goals, or the rendered block without its code fence; "" when there is none."""
+    if not isinstance(res, dict):
+        return ""
+    goals = res.get("goals")
+    if isinstance(goals, list):
+        parts = [str(g).strip() for g in goals if str(g).strip()]
+        if parts:
+            return "\n\n".join(parts)
+    rendered = str(res.get("rendered") or "").strip()
+    rendered = re.sub(r"^```\w*\n?", "", rendered)
+    rendered = re.sub(r"\n?```$", "", rendered)
+    return rendered.strip()
+
+
+def render_term_goal(res) -> str:
+    """The text of a $/lean/plainTermGoal result (the expected type of a term-mode hole); "" when there is none."""
+    if not isinstance(res, dict):
+        return ""
+    return str(res.get("goal") or "").strip()
+
+
+def quote_block(text: str) -> str:
+    """Multi-line content for the [[LEAK_GOALS]] / [[LEAK_INFO]] blocks: every line prefixed, so no line of it can match the
+    "Line N (Error|Warning):" grammar or the "Suggestion @"/"[[" markers a caller parses, and the compiler's own phrases a caller
+    tests the verdict by ("Compilation Successful", "Compilation Failed", "100% verified") are disarmed."""
+    text = str(text).replace("❌", "(x)").replace("✅", "(ok)").replace("[[", "[ [")
+    text = re.sub(r"(?i)compilation (successful|failed)", r"compilation_\1", text)
+    text = text.replace("100% verified", "100%_verified")
+    return "\n".join("  | " + ln for ln in text.split("\n"))
+
+
+def cap_block(block: str) -> str:
+    if len(block) <= BLOCK_MAX_CHARS:
+        return block
+    return block[:BLOCK_MAX_CHARS] + f"\n  | … [truncated: {len(block) - BLOCK_MAX_CHARS} more characters]"
+
 
 AXIOM_CHECK = """
 -- Jinshi/Leak axiom-closure gate (2026-10): a clean LSP compile only means
@@ -205,6 +321,10 @@ class LeanCompilerDaemon:
         # Tripped by the stderr watcher when the file worker prints a native
         # abort, so the read loop can bail out immediately instead of hanging.
         self._crash_event = asyncio.Event()
+        # The one read in flight on the LSP stdout. A wait that times out must NOT cancel it: a message half-read (its header
+        # consumed, its body not) would leave every later read parsing a body as headers. The read stays pending and the next
+        # wait takes it over. Dropped when the process is replaced.
+        self._read_fut: asyncio.Future | None = None
         self.version = 1                    # monotonic LSP document version
         self.request_id = 1000              # monotonic LSP request id
         self.verify_count = 0               # for log correlation
@@ -247,6 +367,7 @@ class LeanCompilerDaemon:
             start_new_session=True,
         )
         asyncio.create_task(self._log_stderr())
+        self._read_fut = None
         await self._send("initialize", {
             "processId": os.getpid(),
             "rootUri": Path(self.project_dir).resolve().as_uri(),
@@ -315,25 +436,81 @@ class LeanCompilerDaemon:
         waitForDiagnostics, so a plain read would block for the full timeout —
         exactly the 3-minute hang from the 2026-07-12 outage. We race the read
         against the crash signal the stderr watcher sets on 'Aborting.'."""
-        read_fut = asyncio.ensure_future(self._read())
+        if self._read_fut is None or (self._read_fut.done() and self._read_fut.cancelled()):
+            self._read_fut = asyncio.ensure_future(self._read())
+        read_fut = self._read_fut
         crash_fut = asyncio.ensure_future(self._crash_event.wait())
         try:
             done, _ = await asyncio.wait(
                 {read_fut, crash_fut}, timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED)
             if read_fut in done:
+                self._read_fut = None
                 return read_fut.result()          # normal message (or raises EOF/etc.)
             if crash_fut in done:
                 raise WorkerCrashed("file worker aborted (native stack overflow)")
             raise TimeoutError(f"verify exceeded {timeout:.0f}s")
         finally:
-            for f in (read_fut, crash_fut):
-                if not f.done():
-                    f.cancel()
+            # the read is left in flight (see _read_fut); only the crash wait is cancelled
+            if not crash_fut.done():
+                crash_fut.cancel()
+            try:
+                await crash_fut
+            except BaseException:
+                pass  # swallow the cancellation / already-handled exception
+
+    async def _query_goals(self, full_text: str, deadline: float, n: int) -> list[tuple[int, str]]:
+        """The goal at every `sorry` of `full_text`, as (0-based line, text), from the file worker that has just elaborated it:
+        $/lean/plainGoal, then $/lean/plainTermGoal where that gave nothing (a term-mode sorry). Bounded by `deadline` (a wall-clock
+        time): what has not answered by then is left out, and its request stays pending (a late answer is ignored by the next verify,
+        which only looks for its own ids). A worker crash here is logged and ends the queries; the verdict already in hand stands,
+        and the next verify finds and replaces the dead worker."""
+        positions = sorry_positions(full_text)
+        if not positions:
+            return []
+        if len(positions) > GOAL_MAX_SORRIES:
+            logger.info(f"🎯 [#{n}] {len(positions)} sorries; asking for the first {GOAL_MAX_SORRIES}")
+            positions = positions[:GOAL_MAX_SORRIES]
+        pending: dict[int, tuple[int, int, str]] = {}
+
+        async def ask(method: str, ln: int, ch: int):
+            self.request_id += 1
+            pending[self.request_id] = (ln, ch, method)
+            await self._send(method, {"textDocument": {"uri": self.uri}, "position": {"line": ln, "character": ch}},
+                             msg_id=self.request_id)
+
+        found: dict[tuple[int, int], str] = {}
+        try:
+            for ln, ch in positions:
+                await ask("$/lean/plainGoal", ln, ch)
+            while pending:
+                left = deadline - time.time()
+                if left <= 0:
+                    break
                 try:
-                    await f
-                except BaseException:
-                    pass  # swallow the cancellation / already-handled exception
+                    msg = await self._await_message(left)
+                except TimeoutError:
+                    break
+                mid = msg.get("id")
+                if "method" in msg or mid not in pending:
+                    continue  # a notification, or an answer to something else
+                ln, ch, method = pending.pop(mid)
+                res = None if "error" in msg else msg.get("result")
+                if method == "$/lean/plainGoal":
+                    text = render_plain_goal(res)
+                    if text:
+                        found[(ln, ch)] = text
+                    else:
+                        await ask("$/lean/plainTermGoal", ln, ch)
+                else:
+                    text = render_term_goal(res)
+                    if text:
+                        found[(ln, ch)] = text
+        except WorkerCrashed as e:
+            logger.error(f"💥 [#{n}] worker crashed while answering goal queries: {e} (the verdict stands; the next verify replaces it)")
+        if pending:
+            logger.info(f"⏱️  [#{n}] {len(pending)} goal quer(y/ies) unanswered within the goal ceiling; answered without them")
+        return [(ln, found[(ln, ch)]) for ln, ch in positions if (ln, ch) in found]
 
     def _worker_pids(self) -> list[int]:
         """The `lean --worker` processes the watchdog forked: descendants of the
@@ -567,25 +744,30 @@ class LeanCompilerDaemon:
                 # the promise is a hole-free proof, and a warning here is a hole.
                 bad = [d for d in diags if d.get("severity", 1) in (1, 2)]
 
-                # `apply?` / `exact?` / `rw?` / `simp?` report their hits as
-                # severity-3 INFORMATION ("Try this: exact Nat.add_zero n"),
-                # which this filter dropped — so a caller could run apply? and
-                # never read the answer. They are ADVISORY: collected here, they
-                # never touch the pass/fail verdict, and the format deliberately
-                # does NOT match the "Line N (Error|Warning):" grammar callers
-                # parse, so no existing consumer changes behaviour.
-                hints = []
+                # Severity-3 INFORMATION. `apply?` / `exact?` / `rw?` / `simp?`
+                # report their hits as "Try this: exact Nat.add_zero n": those go
+                # behind [[LEAK_SUGGESTIONS]], which callers already read. Every
+                # other info message (`#eval`, `#check`, `trace_state`, `#print`
+                # output) goes behind [[LEAK_INFO]]. Both are ADVISORY: they never
+                # touch the pass/fail verdict, and neither format matches the
+                # "Line N (Error|Warning):" grammar callers parse.
+                hints, infos = [], []
                 for d in diags:
                     if d.get("severity") != 3:
                         continue
-                    m = " ".join(str(d.get("message", "")).split())
-                    if not m.lower().startswith("try this"):
-                        continue
+                    raw = str(d.get("message", ""))
+                    m = " ".join(raw.split())
                     ln = d.get("range", {}).get("start", {}).get("line", 0) + 1
-                    hints.append(f"Suggestion @ line {ln}: {m}")
+                    if m.lower().startswith("try this"):
+                        hints.append(f"Suggestion @ line {ln}: {m}")
+                    else:
+                        infos.append(f"Info @ line {ln}:\n{quote_block(raw.strip())}")
                 hint_block = ("\n[[LEAK_SUGGESTIONS]]\n" + "\n".join(hints)) if hints else ""
+                info_block = cap_block("\n[[LEAK_INFO]]\n" + "\n".join(infos)) if infos else ""
                 if hints:
                     logger.info(f"💡 [#{n}] {len(hints)} tactic suggestion(s) harvested")
+                if infos:
+                    logger.info(f"ℹ️  [#{n}] {len(infos)} info message(s) returned")
 
                 elapsed = int((time.time() - t0) * 1000)
                 self.last_verify_ms = elapsed
@@ -609,7 +791,7 @@ class LeanCompilerDaemon:
                     return (
                         "✅ Compilation Successful! The proof is 100% verified.\n"
                         f"[[LEAK_NORMALIZED_SCRIPT_B64:{normalized_b64}]]"
-                        f"{hint_block}"
+                        f"{info_block}{hint_block}"
                     )
 
                 lines = []
@@ -623,7 +805,25 @@ class LeanCompilerDaemon:
                 if not warming:
                     self.verdicts[reason] += 1
                 logger.info(f"❌ [#{n}] FAILED in {elapsed}ms — {len(bad)} issue(s), reason={reason}")
-                return "❌ Compilation Failed:\n" + "\n".join(lines) + hint_block
+
+                # The goal at every hole, after the verdict is settled: errors that
+                # ARE a goal state (`unsolved goals`, an unfilled `?_`) repeated
+                # with their line breaks, then the goal at each `sorry`, asked of
+                # the worker under its own small ceiling (never the verify cap).
+                goals = []
+                for d in bad:
+                    raw = str(d.get("message", "")).strip()
+                    if d.get("severity", 1) == 1 and GOAL_ERROR_RE.match(raw):
+                        ln = d.get("range", {}).get("start", {}).get("line", 0) + 1
+                        goals.append(f"Goal @ line {ln} (error):\n{quote_block(raw)}")
+                if not warming:
+                    goal_deadline = min(t0 + timeout, time.time() + GOAL_QUERY_TIMEOUT)
+                    for ln, text in await self._query_goals(full_text, goal_deadline, n):
+                        goals.append(f"Goal @ line {ln + 1} (sorry):\n{quote_block(text)}")
+                goal_block = cap_block("\n[[LEAK_GOALS]]\n" + "\n".join(goals)) if goals else ""
+                if goals:
+                    logger.info(f"🎯 [#{n}] {len(goals)} goal state(s) returned")
+                return "❌ Compilation Failed:\n" + "\n".join(lines) + goal_block + info_block + hint_block
 
             except WorkerCrashed as e:
                 # The file worker aborted but the daemon is NOT dead: respawn the
@@ -687,6 +887,17 @@ async def verify_full_script(script: str) -> str:
     A caller that persists "the proof" should decode and store this instead of
     its own `script` argument, so the saved artifact is self-contained and
     doesn't silently depend on this daemon's injection to compile standalone.
+
+    WORKING INCREMENTALLY: a failed compile also carries the goal at every hole.
+    Leave `sorry` where a step is not written yet and the answer ends with a
+    [[LEAK_GOALS]] block giving, for each `sorry`, the hypotheses and the goal at
+    that point (and the same for every `unsolved goals` error and unfilled `?_`,
+    with their line breaks kept). So: write the skeleton, read the goals, fill one
+    hole, resubmit. Output of `#eval`, `#check`, `trace_state` and `#print` comes
+    back in a [[LEAK_INFO]] block, so a probe script is a way to ask the
+    environment a question. `exact?`/`apply?` hits come back under
+    [[LEAK_SUGGESTIONS]]. None of these blocks changes the verdict: a script with
+    a `sorry` in it still fails, and only a sorry-free success counts.
     """
     try:
         return await fast_compiler.verify_script(script)

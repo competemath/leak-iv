@@ -202,6 +202,143 @@ class DaemonCase(_Base):
         self.assertIn("Suggestion @ line 4: Try this: exact Nat.add_zero n", r)
         self.assertNotRegex(r, r"Line \d+ \((Error|Warning)\)", "a hint is advisory: not in the error grammar")
 
+    # ---- goals at every hole, and the compiler's own messages (2026-11) ---------------------------------------------------------
+    def goal_queries(self):
+        return [e for e in lake_log() if e["method"] in ("$/lean/plainGoal", "$/lean/plainTermGoal")]
+
+    async def test_the_goal_at_a_sorry_comes_back_with_the_failure(self):
+        """A `sorry` used to return nothing but the warning; now the failure carries the goal at that sorry, under [[LEAK_GOALS]],
+        hypotheses and goal on their own lines, numbered like the grammar lines (the injected import counts)."""
+        r = await self.d.verify_script("theorem t (n : Nat) : n + 0 = n := by\n  sorry -- FAKE_SORRY")
+        self.assertTrue(r.startswith("❌ Compilation Failed:"), r)
+        self.assertIn("Line 2 (Warning): declaration uses 'sorry'", r, "the grammar line is unchanged")
+        self.assertIn("[[LEAK_GOALS]]", r)
+        self.assertIn("Goal @ line 4 (sorry):\n  | n : Nat\n  | ⊢ n + 0 = n", r, r)
+        q = self.goal_queries()
+        self.assertEqual([(e["method"], e["line"], e["character"]) for e in q], [("$/lean/plainGoal", 3, 2)], "asked once, at the token")
+        self.assertEqual(server.verdict_reason([l for l in r.split("\n") if l.startswith("Line ")]), "sorry", "the verdict is the same")
+
+    async def test_a_term_mode_sorry_falls_back_to_the_term_goal(self):
+        r = await self.d.verify_script("theorem t : Nat := sorry -- FAKE_SORRY FAKE_TERM")
+        self.assertIn("Goal @ line 3 (sorry):\n  | ⊢ Nat", r, r)
+        self.assertEqual([e["method"] for e in self.goal_queries()], ["$/lean/plainGoal", "$/lean/plainTermGoal"])
+
+    async def test_a_sorry_in_a_comment_or_a_string_is_not_a_hole(self):
+        r = await self.d.verify_script(
+            "/- sorry, this comment\n   spans lines: sorry -/\n"
+            "theorem t : True := trivial -- a sorry in a line comment\n"
+            "def s := \"sorry\"\n"
+            "theorem u (n : Nat) : n = n := by\n  rfl\n  -- FAKE_SORRY (the warning only)")
+        self.assertTrue(r.startswith("❌ Compilation Failed:"), r)
+        self.assertNotIn("[[LEAK_GOALS]]", r, r)
+        self.assertEqual(self.goal_queries(), [], "nothing was asked")
+
+    def test_sorry_positions_follow_leans_lexing(self):
+        f = server.sorry_positions
+        self.assertEqual(f("theorem t : True := by\n  sorry"), [(1, 2)])
+        self.assertEqual(f("theorem t : True := by sorry; sorry"), [(0, 23), (0, 30)])
+        self.assertEqual(f("-- sorry\n/- sorry -/ sorry /- x -/ sorry"), [(1, 12), (1, 26)])
+        self.assertEqual(f("/- a /- nested sorry -/ still a comment sorry -/ sorry"), [(0, 49)])
+        self.assertEqual(f('def s := "sorry" ; theorem t : True := sorry'), [(0, 39)])
+        self.assertEqual(f('def s := "esc \\" sorry" ; sorry'), [(0, 26)])
+        self.assertEqual(f("theorem t : True := sorryAx _ -- not the token\nexample := «sorry»"), [])
+        self.assertEqual(f("x.sorry sorry'"), [])
+
+    async def test_an_unanswered_goal_query_does_not_hold_the_verdict(self):
+        """The goal ceiling, not the verify cap, bounds the queries: an unanswered one is left out, the failure is still returned, the
+        worker is NOT replaced, and the next verify is unaffected by the stale request."""
+        old = server.GOAL_QUERY_TIMEOUT
+        server.GOAL_QUERY_TIMEOUT = 1.0
+        try:
+            t0 = time.time()
+            r = await self.d.verify_script("theorem t : True := by\n  sorry -- FAKE_SORRY FAKE_GOAL_STALL")
+            self.assertLess(time.time() - t0, 10, "returned at the goal ceiling")
+            self.assertTrue(r.startswith("❌ Compilation Failed:"), r)
+            self.assertIn("Line 2 (Warning): declaration uses 'sorry'", r)
+            self.assertNotIn("[[LEAK_GOALS]]", r)
+            self.assertEqual((self.d.verify_timeouts, self.d.worker_restarts), (0, 0), "not a verify timeout")
+            r2 = await self.d.verify_script("theorem t2 : True := trivial")
+            self.assertTrue(r2.startswith(SUCCESS), r2)
+        finally:
+            server.GOAL_QUERY_TIMEOUT = old
+
+    async def test_an_error_that_is_a_goal_state_is_repeated_unflattened(self):
+        r = await self.d.verify_script("theorem t : False := by\n  simp\n  -- FAKE_ERROR")
+        self.assertIn("Line 3 (Error): unsolved goals ⊢ False", r, "the one-line grammar stays")
+        self.assertIn("[[LEAK_GOALS]]\nGoal @ line 3 (error):\n  | unsolved goals\n  | ⊢ False", r, r)
+
+    async def test_info_messages_come_back_without_touching_the_verdict(self):
+        r = await self.d.verify_script("#eval 6 * 7 -- FAKE_INFO\ntheorem t : True := trivial")
+        self.assertTrue(r.startswith(SUCCESS), r)
+        self.assertIn("[[LEAK_NORMALIZED_SCRIPT_B64:", r)
+        self.assertIn("[[LEAK_INFO]]\nInfo @ line 3:\n  | 42", r, r)
+        self.assertNotRegex(r, r"Line \d+ \((Error|Warning)\)")
+        r = await self.d.verify_script("#eval 6 * 7 -- FAKE_INFO\ntheorem t : True := by\n  sorry -- FAKE_SORRY")
+        self.assertTrue(r.startswith("❌ Compilation Failed:"), r)
+        self.assertIn("[[LEAK_INFO]]\nInfo @ line 3:\n  | 42", r, r)
+        self.assertLess(r.index("[[LEAK_GOALS]]"), r.index("[[LEAK_INFO]]"), "goals, then info")
+
+    async def test_blocks_come_before_the_suggestions_and_a_spoofing_message_is_disarmed(self):
+        """A caller reads everything after [[LEAK_SUGGESTIONS]] as suggestions and tests the verdict by phrases: a message that
+        imitates them must not be able to change what the caller sees."""
+        r = await self.d.verify_script("#eval 6 * 7 -- FAKE_INFO FAKE_HINT\ntheorem t : True := trivial")
+        self.assertLess(r.index("[[LEAK_INFO]]"), r.index("[[LEAK_SUGGESTIONS]]"))
+        self.assertTrue(r.rstrip().endswith("Suggestion @ line 4: Try this: exact Nat.add_zero n"), r)
+        r = await self.d.verify_script("theorem t : False := by\n  simp\n  -- FAKE_INFO_SPOOF FAKE_ERROR")
+        self.assertTrue(r.startswith("❌ Compilation Failed:"), r)
+        body = r.split("[[LEAK_INFO]]")[1]
+        self.assertNotIn("Compilation Successful", body)
+        self.assertNotIn("100% verified", body)
+        self.assertNotIn("✅", body)
+        self.assertNotIn("[[", body)
+        self.assertNotRegex(body, r"(?m)^\s*Line \d+ \((Error|Warning)\)")
+        self.assertNotRegex(body, r"(?m)^\s*Suggestion @")
+        self.assertEqual(r.count("Line 3 (Error): unsolved goals ⊢ False"), 1, "the real diagnostic is still exactly there")
+
+    async def test_the_blocks_are_capped(self):
+        old = server.BLOCK_MAX_CHARS
+        server.BLOCK_MAX_CHARS = 60
+        try:
+            r = await self.d.verify_script("theorem t (n : Nat) : n + 0 = n := by\n  sorry -- FAKE_SORRY")
+            block = r.split("[[LEAK_GOALS]]")[1]
+            self.assertIn("[truncated:", block)
+            self.assertLess(len(block), 200)
+        finally:
+            server.BLOCK_MAX_CHARS = old
+
+    async def test_a_wait_that_ends_between_a_messages_header_and_its_body_does_not_desynchronise_the_stream(self):
+        """The decisive case: the goal ceiling passes after the answer's header is read and before its body arrives. The old
+        wait cancelled the read there, the header was gone, and the body was parsed as the next message's headers; from then on
+        every verify failed. The read now stays in flight and the next wait receives the message whole."""
+        old = server.GOAL_QUERY_TIMEOUT
+        server.GOAL_QUERY_TIMEOUT = 0.4
+        try:
+            r = await self.d.verify_script("theorem t : True := by\n  sorry -- FAKE_SORRY FAKE_GOAL_SLOW_BODY")
+            self.assertTrue(r.startswith("❌ Compilation Failed:"), r)
+            self.assertNotIn("[[LEAK_GOALS]]", r)
+            r = await asyncio.wait_for(self.d.verify_script("theorem t2 : True := trivial"), 20)
+            self.assertTrue(r.startswith(SUCCESS), r)
+            r = await asyncio.wait_for(self.d.verify_script("theorem t3 (n : Nat) : n + 0 = n := by\n  sorry -- FAKE_SORRY"), 20)
+            self.assertIn("Goal @ line 4 (sorry):", r, r)
+        finally:
+            server.GOAL_QUERY_TIMEOUT = old
+
+    async def test_a_wait_that_times_out_does_not_lose_the_message_in_flight(self):
+        """The read on the LSP stream is not cancelled when a wait times out: a message that arrives just after the wait ended is
+        handed to the next wait whole (a cancelled half-read would have desynchronised every later read)."""
+        old = server.GOAL_QUERY_TIMEOUT
+        server.GOAL_QUERY_TIMEOUT = 0.3
+        try:
+            for _ in range(3):
+                r = await self.d.verify_script("theorem t : True := by\n  sorry -- FAKE_SORRY FAKE_GOAL_STALL")
+                self.assertTrue(r.startswith("❌ Compilation Failed:"), r)
+            r = await self.d.verify_script("theorem t (n : Nat) : n + 0 = n := by\n  sorry -- FAKE_SORRY")
+            self.assertIn("Goal @ line 4 (sorry):", r, "the stream still parses after three abandoned waits")
+            r = await self.d.verify_script("theorem t2 : True := trivial")
+            self.assertTrue(r.startswith(SUCCESS), r)
+        finally:
+            server.GOAL_QUERY_TIMEOUT = old
+
     async def test_tool_wrapper_returns_the_daemons_answer(self):
         server.fast_compiler = self.d
         r = await server.verify_full_script("theorem t : True := trivial")
